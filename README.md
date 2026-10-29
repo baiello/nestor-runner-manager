@@ -76,7 +76,7 @@ swift test -Xswiftc -load-plugin-library -Xswiftc /Library/Developer/CommandLine
 
 ## Next steps
 
-1. Shared core in Rust (`core/`): a local service that supervises the existing Nestor runner — without rewriting it — exposed to the interface over an authenticated local IPC, and a `RunnerService` implementation in the macOS app that talks to it. First target: a real runner on the Mac Studio.
+1. Shared core in Rust (`core/`): a local service that supervises the existing Nestor runner — without rewriting it — and a `RunnerService` implementation in the macOS app that talks to it. How the app reaches the core (a command-line tool with JSON output or a local IPC) is still to be decided. First target: a real runner on the Mac Studio.
 2. Real association with Nestor (browser confirmation), one identity per runner, individual revocation, credentials in the system keychain.
 3. Start at boot without the interface open, tested across restarts.
 4. Windows and Linux clients on the same core.

@@ -10,7 +10,7 @@ Nestor Runner Manager is planned as native interfaces per operating system on to
 │  RunnerService ◄─────────┼──┐       │                  │
 │   ├ DemoRunnerService    │  │       │                  │
 │   └ (live service)       │  │       │                  │
-└──────────────────────────┘  │  local authenticated IPC (later)
+└──────────────────────────┘  │  local channel, to be decided
                               ▼       ▼                  ▼
                    ┌────────────────────────────────────────┐
                    │ core/ — shared Rust service (later)    │
@@ -30,7 +30,9 @@ Nestor Runner Manager is planned as native interfaces per operating system on to
   - **`RunnerManagerModel`**, the observable interface state (loading / loaded / failed per section, commands in flight, last error), tested without SwiftUI.
 - **`NestorRunnerManager`** — the SwiftUI app. Views read `RunnerManagerModel` and never call a service directly.
 
-Replacing the demo with the real core means writing one more `RunnerService` implementation (for example `CoreRunnerService`, talking to the Rust service) and choosing it at launch. The views and the model stay as they are.
+Replacing the demo with the real core means writing one more `RunnerService` implementation (for example `CoreRunnerService`) and choosing it at launch. The views and the model stay as they are.
+
+How that implementation reaches the core is not decided yet: calling a command-line tool with JSON output or a local IPC with its own access control are both open, and the choice belongs to the architecture review. `RunnerService` is shaped to fit either.
 
 ## Rules the prototype keeps
 
