@@ -7,6 +7,7 @@ import SwiftUI
 @MainActor
 enum Snapshots {
     static let size = NSSize(width: 1040, height: 680)
+    static let tall = NSSize(width: 1040, height: 1020)
 
     static func render(to directory: URL) {
         NSApplication.shared.setActivationPolicy(.prohibited)
@@ -15,16 +16,19 @@ enum Snapshots {
         let populated = loadedModel(.populated)
         let runners = populated.runners.value ?? []
         let byName = Dictionary(uniqueKeysWithValues: runners.map { ($0.name, $0.id) })
+        let paused = loadedModel(.populated)
+        perform { await paused.setMode(.paused) }
 
         let scenes: [(String, AnyView, NSSize)] = [
-            ("01-overview", AnyView(ContentView(model: populated)), size),
-            ("02-runner-running", AnyView(ContentView(model: populated, selection: byName["studio-build"].map(SidebarItem.runner))), size),
-            ("03-runner-failed", AnyView(ContentView(model: populated, selection: byName["studio-gpu"].map(SidebarItem.runner))), size),
-            ("04-add-runner", AnyView(AddRunnerSheet(model: populated, form: sampleForm(), onAdded: { _ in })), NSSize(width: 460, height: 340)),
-            ("05-not-associated", AnyView(ContentView(model: loadedModel(.notAssociated))), size),
-            ("06-no-runner", AnyView(ContentView(model: loadedModel(.empty))), size),
-            ("07-service-unavailable", AnyView(ContentView(model: loadedModel(.unavailable))), size),
-            ("08-loading", AnyView(ContentView(model: RunnerManagerModel(service: DemoRunnerService(latency: .seconds(3600))))), size),
+            ("01-machine", AnyView(ContentView(model: populated)), tall),
+            ("02-machine-paused", AnyView(ContentView(model: paused)), tall),
+            ("03-diagnostics", AnyView(ContentView(model: populated, selection: .diagnostics)), size),
+            ("04-runner-busy", AnyView(ContentView(model: populated, selection: byName["runner-1"].map(SidebarItem.runner))), size),
+            ("05-runner-failed", AnyView(ContentView(model: populated, selection: byName["runner-3"].map(SidebarItem.runner))), size),
+            ("06-add-runner", AnyView(AddRunnerSheet(model: populated, form: sampleForm(), onAdded: { _ in })), NSSize(width: 460, height: 340)),
+            ("07-not-associated", AnyView(ContentView(model: loadedModel(.notAssociated))), tall),
+            ("08-service-unavailable", AnyView(ContentView(model: loadedModel(.unavailable))), size),
+            ("09-loading", AnyView(ContentView(model: RunnerManagerModel(service: DemoRunnerService(latency: .seconds(3600))))), size),
         ]
 
         for (name, view, size) in scenes {
@@ -35,6 +39,32 @@ enum Snapshots {
                 print("failed \(url.path)")
             }
         }
+    }
+
+    /// Renders the machine view and the diagnostics from a running local service
+    /// (`--snapshot <dir> --socket <path> [--snapshot-prefix <name>]`).
+    static func renderService(at socket: String, prefix: String, to directory: URL) {
+        NSApplication.shared.setActivationPolicy(.prohibited)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let model = RunnerManagerModel(service: LiveRunnerService(socketPath: socket))
+        perform { await model.load() }
+        let scenes: [(String, AnyView, NSSize)] = [
+            ("\(prefix)-machine", AnyView(ContentView(model: model)), tall),
+            ("\(prefix)-diagnostics", AnyView(ContentView(model: model, selection: .diagnostics)), size),
+        ]
+        for (name, view, size) in scenes {
+            let url = directory.appendingPathComponent("\(name).png")
+            print(write(view, size: size, to: url) ? "wrote \(url.path)" : "failed \(url.path)")
+        }
+    }
+
+    private static func perform(_ work: @escaping @MainActor () async -> Void) {
+        var done = false
+        Task {
+            await work()
+            done = true
+        }
+        spin(until: { done })
     }
 
     private static func sampleForm() -> AddRunnerForm {

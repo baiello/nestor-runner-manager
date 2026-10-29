@@ -20,6 +20,9 @@ public final class RunnerManagerModel {
 
     public private(set) var machine: Loadable<MachineInfo> = .loading
     public private(set) var connection: Loadable<NestorConnection> = .loading
+    public private(set) var status: Loadable<MachineStatus> = .loading
+    /// A settings change (mode or ceiling) is in flight; the controls are disabled meanwhile.
+    public private(set) var isUpdatingSettings = false
     public private(set) var runners: Loadable<[Runner]> = .loading
     public private(set) var logs: [Runner.ID: Loadable<[LogEntry]>] = [:]
     /// Runners with a command in flight; their actions are disabled meanwhile.
@@ -34,7 +37,11 @@ public final class RunnerManagerModel {
         self.service = service
     }
 
-    public var isDemo: Bool { service.mode == .demo }
+    /// Whether to show the demo banner. The service's own report wins; until it has answered,
+    /// the client's declared mode is used. Anything but an explicit `.live` counts as demo.
+    public var isDemo: Bool {
+        (status.value?.serviceMode ?? service.mode) != .live
+    }
 
     public var isAssociated: Bool {
         if case .loaded(.associated) = connection { true } else { false }
@@ -44,17 +51,32 @@ public final class RunnerManagerModel {
         runners.value?.first { $0.id == id }
     }
 
-    /// Loads the machine, the connection and the runners together.
+    /// Loads the machine, its status, the connection and the runners together.
     public func load() async {
         machine = .loading
         connection = .loading
+        status = .loading
         runners = .loading
         async let machineResult = capture { try await self.service.machineInfo() }
         async let connectionResult = capture { try await self.service.connection() }
+        async let statusResult = capture { try await self.service.machineStatus() }
         async let runnersResult = capture { try await self.service.runners() }
         machine = await machineResult
         connection = await connectionResult
+        status = await statusResult
         runners = await runnersResult
+    }
+
+    /// Periodic refresh of what moves on its own (status, connection, runners). A failure only
+    /// replaces a value that was not loaded, so a transient error does not blank the screen.
+    public func refresh() async {
+        async let statusResult = capture { try await self.service.machineStatus() }
+        async let connectionResult = capture { try await self.service.connection() }
+        async let runnersResult = capture { try await self.service.runners() }
+        let (newStatus, newConnection, newRunners) = await (statusResult, connectionResult, runnersResult)
+        if newStatus.value != nil || status.value == nil { status = newStatus }
+        if newConnection.value != nil || connection.value == nil { connection = newConnection }
+        if newRunners.value != nil || runners.value == nil { runners = newRunners }
     }
 
     public func associate() async {
@@ -62,8 +84,37 @@ public final class RunnerManagerModel {
         defer { isAssociating = false }
         do {
             connection = .loaded(try await service.associate())
+            status = await capture { try await self.service.machineStatus() }
         } catch {
             actionError = Self.message(for: error)
+        }
+    }
+
+    /// Pauses or resumes admissions. Running tasks are never stopped.
+    public func setMode(_ mode: AdmissionMode) async {
+        await updateSettings { service, revision in try await service.setMode(mode, expectedRevision: revision) }
+    }
+
+    /// Changes how many tasks may run at the same time. Lowering it interrupts no task.
+    public func setMaxConcurrentTasks(_ value: Int) async {
+        await updateSettings { service, revision in
+            try await service.setMaxConcurrentTasks(value, expectedRevision: revision)
+        }
+    }
+
+    private func updateSettings(
+        _ change: @escaping (any RunnerService, Int) async throws -> MachineStatus
+    ) async {
+        guard let current = status.value, !isUpdatingSettings else { return }
+        isUpdatingSettings = true
+        defer { isUpdatingSettings = false }
+        do {
+            status = .loaded(try await change(service, current.configRevision))
+        } catch {
+            actionError = Self.message(for: error)
+            // On a conflict (or any refusal) show what the service holds now.
+            let reloaded = await capture { try await self.service.machineStatus() }
+            if reloaded.value != nil { status = reloaded }
         }
     }
 
@@ -84,8 +135,9 @@ public final class RunnerManagerModel {
         await perform(on: id) { try await self.service.start(runnerID: id) }
     }
 
-    public func stop(_ id: Runner.ID) async {
-        await perform(on: id) { try await self.service.stop(runnerID: id) }
+    /// Stops a runner from the diagnostics. `force` is needed for a busy runner and ends its task.
+    public func stop(_ id: Runner.ID, force: Bool = false) async {
+        await perform(on: id) { try await self.service.stop(runnerID: id, force: force) }
     }
 
     public func remove(_ id: Runner.ID) async {

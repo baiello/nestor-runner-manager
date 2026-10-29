@@ -1,11 +1,13 @@
 import RunnerManagerKit
 import SwiftUI
 
-/// A runner's state, resources, actions and logs.
+/// A runner's state, resources, actions and logs — a diagnostic page: the service starts and
+/// stops runners by itself.
 struct RunnerDetailView: View {
     var model: RunnerManagerModel
     var runner: Runner
     @State private var isConfirmingRemoval = false
+    @State private var isConfirmingBusyStop = false
 
     private var isBusy: Bool { model.busyRunners.contains(runner.id) }
 
@@ -42,11 +44,23 @@ struct RunnerDetailView: View {
                  ? "Demo: the runner is removed from this simulation only."
                  : "The runner is removed from this machine and its identity is revoked in Nestor.")
         }
+        .confirmationDialog(
+            "Stop “\(runner.name)” during its task?",
+            isPresented: $isConfirmingBusyStop,
+            titleVisibility: .visible
+        ) {
+            Button("Stop and End the Task", role: .destructive) {
+                Task { await model.stop(runner.id, force: true) }
+            }
+        } message: {
+            Text("The task \(runner.currentTaskRef ?? "") is interrupted; Nestor decides whether it runs again. To stop taking tasks without interrupting any, pause the machine instead.")
+        }
     }
 
     private var header: some View {
         HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: 6) {
+                Text("Diagnostics").font(.callout).foregroundStyle(.secondary)
                 Text(runner.name).font(.largeTitle.bold())
                 HStack(spacing: 10) {
                     StateBadge(state: runner.state)
@@ -58,7 +72,11 @@ struct RunnerDetailView: View {
             if isBusy { ProgressView().controlSize(.small) }
             if runner.state.canStop {
                 Button {
-                    Task { await model.stop(runner.id) }
+                    if runner.state == .busy {
+                        isConfirmingBusyStop = true
+                    } else {
+                        Task { await model.stop(runner.id) }
+                    }
                 } label: {
                     Label("Stop", systemImage: "stop.fill")
                 }
@@ -92,13 +110,13 @@ struct RunnerDetailView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
             Divider()
-            InfoRow(label: "Job", value: runner.usage.isRunningJob ? "Running a job" : "Idle")
-            InfoRow(label: "Capacity", value: "One job at a time")
-            Text("The job may use several threads and processes. To run jobs in parallel, add more runners. Their isolation from each other is not guaranteed.")
+            InfoRow(label: "Task", value: runner.currentTaskRef ?? (runner.usage.isRunningJob ? "Running a task" : "None"))
+            InfoRow(label: "Capacity", value: "One task at a time")
+            Text("The task may use several threads and processes. The service runs one runner per task it accepts; runners' isolation from each other is not guaranteed.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
             if let lastJob = runner.lastJobAt {
-                Text("Last job \(Format.relative(lastJob))")
+                Text("Last task \(Format.relative(lastJob))")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
