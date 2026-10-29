@@ -30,10 +30,17 @@ import Testing
         #expect(!model.isAssociated)
     }
 
-    @Test func associatingUnlocksAddingRunners() async throws {
+    @Test func associatingUnlocksAddingRunnersOnceTheAccountIsConfirmed() async throws {
         let model = await loadedModel(.notAssociated)
         #expect(!model.isAssociated)
         await model.associate()
+        // Approved on Nestor: the owner confirms the account first (M1).
+        #expect(!model.isAssociated)
+        guard case .loaded(.confirming) = model.connection else {
+            Issue.record("expected the account to confirm")
+            return
+        }
+        await model.confirmAssociation(accept: true)
         #expect(model.isAssociated)
         let runner = try await model.addRunner(NewRunnerRequest(name: "new"))
         #expect(model.runner(runner.id) == runner)

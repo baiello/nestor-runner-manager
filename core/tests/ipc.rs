@@ -182,6 +182,15 @@ fn sensitive_operations_need_a_confirmation() {
     // The next poll, after the server's interval, gets the approval.
     running.time.fetch_add(6_000, Ordering::SeqCst);
     running.supervisor.tick(&running.associator.tick());
+    // M1: the owner confirms the account Nestor gave, on the machine, before any runner.
+    let confirming = call(&running.socket, "connection", json!({}))["result"].clone();
+    assert_eq!(confirming["state"], "confirming");
+    assert_eq!(confirming["accountEmail"], "o***r@example.com");
+    assert_eq!(confirming["approvedByEmail"], "a***n@example.com");
+    let accept = call(&running.socket, "confirmAssociation", json!({ "accept": true }));
+    assert_eq!(accept["error"]["code"], "confirmationRequired");
+    let accepted = call(&running.socket, "confirmAssociation", json!({ "accept": true, "confirmed": true }));
+    assert_eq!(accepted["result"]["state"], "associated");
     assert_eq!(call(&running.socket, "connection", json!({}))["result"]["state"], "associated");
 
     let raise = call(&running.socket, "setMaxConcurrentTasks", json!({ "value": 3 }));

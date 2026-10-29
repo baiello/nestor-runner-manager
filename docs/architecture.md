@@ -20,7 +20,11 @@ Nestor Runner Manager has native interfaces per operating system on top of one s
                │              drains, terminations, crash │
                │              backoff, adoption on start  │
                │  Associator  device authorization, key,  │
-               │              revocation  ──► NestorApi   │
+               │              account confirmation (M1),  │
+               │              heartbeat, queue, tokens,   │
+               │              disassociation              │
+               │  MachineClient  proof v2, one request at │
+               │              a time  ──► NestorApi       │
                │  FileStore   state.json (no secret)      │
                │  Secrets     Keychain, Secure Enclave    │
                │  Launcher    ProcessLauncher (argv, fd 3 │
@@ -32,7 +36,7 @@ Nestor Runner Manager has native interfaces per operating system on top of one s
 
 - **Admission is not a resource quota.** The machine accepts at most `maxConcurrentTasks` tasks at the same time (1 by default, adjustable). No runner has a processor or memory limit (KCA-714); load figures are measurements.
 - **One job per runner process.** Launching a "one job" runner *is* the admission: it claims at most one task, runs it and exits. Several runners per machine; each keeps a stable identity and a new generation per launch.
-- **One scope at a time** (B1(b)): runners alive together all claim from the same workspace scope; Nestor enforces it at claim time (S6).
+- **One scope at a time** (B1(b)): runners alive together all claim from the same workspace scope; Nestor enforces it at claim time (S6). More than one task at a time only once Nestor announces `capabilities.scope_filter`, and never above the limit its administrator set (`leases.administrator_max`); launches are sized by Nestor's count of eligible jobs minus the runners already waiting for one. No `--scope` is passed yet.
 - **Pause** holds back new tasks; **lowering the ceiling** too. Neither stops a running task: runners without a task are drained. Only revocation, disassociation and a forced stop end a running task.
 - **No double launch.** Every supervisor operation runs under one lock; reports from an older generation are ignored. One service per data directory (`flock`). After a restart nothing is launched until the processes left running are adopted (pid, start time and generation must all match) or cleared.
 - **Crashes** relaunch with an exponential backoff (1 s, 2 s, 4 s … up to 5 min); after five in a row the runner is `failed` and left for diagnosis. A task lost with its runner is reported `runnerLost`; Nestor's existing policy decides what happens to it.

@@ -61,6 +61,11 @@ public final class LiveRunnerService: RunnerService {
         try await call("cancelAssociation", as: Wire.Connection.self).model
     }
 
+    public func confirmAssociation(accept: Bool) async throws -> NestorConnection {
+        // The interface showed the account and the user answered.
+        try await call("confirmAssociation", ["accept": accept, "confirmed": true], as: Wire.Connection.self).model
+    }
+
     public func disassociate() async throws -> NestorConnection {
         // The interface asked the user first: running tasks end.
         try await call("disassociate", ["confirmed": true], as: Wire.Connection.self).model
@@ -310,6 +315,8 @@ enum Wire {
         var userCode: String?
         var verificationUri: String?
         var expiresAtMs: UInt64?
+        var accountEmail: String?
+        var approvedByEmail: String?
 
         var model: NestorConnection {
             switch state {
@@ -319,6 +326,12 @@ enum Wire {
                     userCode: userCode ?? "",
                     verificationURL: verificationUri ?? "",
                     expiresAt: Wire.date(expiresAtMs ?? 0)
+                )
+            case "confirming":
+                .confirming(
+                    instance: instance ?? "?",
+                    accountEmail: accountEmail ?? "?",
+                    approvedByEmail: approvedByEmail ?? "?"
                 )
             case "associated": .associated(instance: instance ?? "?", since: Wire.date(sinceMs ?? 0))
             case "unreachable": .unreachable(instance: instance ?? "?", reason: reason ?? "")
@@ -371,6 +384,8 @@ enum Wire {
         var activeTasks: [TaskBody]
         var load: Load?
         var configError: String?
+        /// Absent from services older than R6.
+        var claude: String?
 
         var model: MachineStatus {
             MachineStatus(
@@ -396,7 +411,8 @@ enum Wire {
                     )
                 },
                 configError: configError,
-                effectiveMaxConcurrentTasks: effectiveMaxConcurrentTasks
+                effectiveMaxConcurrentTasks: effectiveMaxConcurrentTasks,
+                claude: claude.flatMap(ClaudeSignIn.init(rawValue:)) ?? .unknown
             )
         }
     }

@@ -17,7 +17,18 @@ A desktop application and a local service to put a machine at Nestor's disposal.
 
 A runner takes **one task at a time**; that task may use several threads and processes. There is **no processor or memory limit** per runner: the number of tasks at a time regulates admissions, and the figures shown are measurements.
 
-Workspaces are not assigned here: on the Nestor web app, workspaces are assigned to the machine. The interface never asks for a password or a token: an administrator approves the machine on Nestor with a code the interface shows, and Nestor issues a short-lived credential for each runner launch. Security design and evidence: [docs/security.md](docs/security.md).
+Workspaces are not assigned here: on the Nestor web app, workspaces are assigned to the machine. The interface never asks for a password or a token: an administrator approves the machine on Nestor with a code the interface shows — never give that code to anyone — then the interface shows the Nestor account the machine would work for, and nothing runs until you confirm it is yours. Nestor issues a short-lived credential for each runner launch. Security design and evidence: [docs/security.md](docs/security.md).
+
+### Claude Code on this Mac (one step, by the Mac's user)
+
+The service never sends nor keeps a Claude Code token. Each runner uses the one its Mac's user keeps, once, in their login keychain:
+
+```sh
+claude setup-token                 # makes a long-lived token for Claude Code
+nestor-runner claude-token set     # keeps it in the login keychain (macOS); paste it when asked
+```
+
+Run it in a terminal of that user's session (the login keychain is the session's). Until it is done, every task on the Mac fails `claude_not_signed_in`, and the app shows **Claude is not signed in** once a runner reports that reason (`run-once` does not report it yet: see docs/security.md).
 
 | Paused | Diagnostics | Busy runner | Failed runner |
 | --- | --- | --- | --- |
@@ -26,6 +37,10 @@ Workspaces are not assigned here: on the Nestor web app, workspaces are assigned
 | Add a runner (advanced) | Not associated | Service unavailable | Loading |
 | --- | --- | --- | --- |
 | ![Add a runner](docs/screenshots/06-add-runner.png) | ![Not associated](docs/screenshots/07-not-associated.png) | ![Service unavailable](docs/screenshots/08-service-unavailable.png) | ![Loading](docs/screenshots/09-loading.png) |
+
+| Waiting for approval — never give the code | Confirm the Nestor account (M1) | Claude is not signed in (A7) |
+| --- | --- | --- |
+| ![Associating](docs/screenshots/12-associating.png) | ![Confirming](docs/screenshots/13-confirming.png) | ![Claude not signed in](docs/screenshots/14-claude-not-signed-in.png) |
 
 Through the real local service (diagnostics):
 
@@ -62,7 +77,7 @@ swift build -c release --arch arm64           # Apple Silicon release build
 lipo -archs "$(swift build -c release --arch arm64 --show-bin-path)/NestorRunnerManager"   # → arm64
 ```
 
-Demo scenarios (`--demo-scenario`): `populated` (default), `empty`, `notAssociated`, `associating`, `unavailable`. They apply to the in-app demo only: the app refuses `--demo-scenario` together with `--service` or `--socket`.
+Demo scenarios (`--demo-scenario`): `populated` (default), `empty`, `notAssociated`, `associating`, `confirming`, `claudeNotSignedIn`, `unavailable`. They apply to the in-app demo only: the app refuses `--demo-scenario` together with `--service` or `--socket`.
 
 With the local service (see [core/README.md](core/README.md)):
 

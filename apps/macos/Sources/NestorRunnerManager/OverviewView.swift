@@ -13,6 +13,7 @@ struct OverviewView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 Text("This Mac").font(.largeTitle.bold())
+                claudeBanner
                 connectionCard
                 tasksCard
                 activeTasksCard
@@ -62,10 +63,39 @@ struct OverviewView: View {
                     Button("Cancel") { Task { await model.cancelAssociation() } }
                         .disabled(!model.canChange)
                 }
+                Label(
+                    "Never give this code to anyone, nor type a code someone gave you: whoever approves it first gets this Mac to run their tasks.",
+                    systemImage: "exclamationmark.shield.fill"
+                )
+                .font(.callout.weight(.medium))
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
                 Text("The code alone gives no access: the approval needs an administrator signed in to Nestor. Nothing secret is shown or typed here.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+            case .loaded(.confirming(let instance, let accountEmail, let approvedByEmail)):
+                Label("Confirm the Nestor account", systemImage: "person.badge.shield.checkmark")
+                    .foregroundStyle(.orange)
+                Text("Nestor approved this Mac. Check that this is your account before it takes any task:")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                InfoRow(label: "Account", value: accountEmail)
+                InfoRow(label: "Approved by", value: approvedByEmail)
+                InfoRow(label: "Instance", value: instance)
+                Text("Nestor masks the addresses. Nothing runs on this Mac until you confirm.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    Button("This Is My Account") { Task { await model.confirmAssociation(accept: true) } }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!model.canChange)
+                    Button("Not Mine — Disassociate", role: .destructive) {
+                        Task { await model.confirmAssociation(accept: false) }
+                    }
+                    .disabled(!model.canChange)
+                }
             case .loaded(.unreachable(let instance, let reason)):
                 Label("Unreachable", systemImage: "wifi.exclamationmark").foregroundStyle(.orange)
                 InfoRow(label: "Instance", value: instance)
@@ -87,6 +117,33 @@ struct OverviewView: View {
                     .fixedSize(horizontal: false, vertical: true)
                 associateButton
             }
+        }
+    }
+
+    /// A7: jobs fail while Claude Code is not signed in on this Mac. The service never holds its
+    /// token; the Mac's user keeps it once in a terminal of their session.
+    @ViewBuilder
+    private var claudeBanner: some View {
+        if case .loaded(let status) = model.status, status.claude == .notSignedIn {
+            VStack(alignment: .leading, spacing: 6) {
+                Label("Claude is not signed in", systemImage: "exclamationmark.triangle.fill")
+                    .font(.headline)
+                    .foregroundStyle(.orange)
+                Text("Tasks on this Mac fail until Claude Code's token is kept for its runners. In Terminal, as this Mac's user, run once:")
+                    .font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("nestor-runner claude-token set")
+                    .font(.system(.callout, design: .monospaced))
+                    .textSelection(.enabled)
+                Text("Make the token with `claude setup-token` first. It stays in your login keychain; this app and its service never see it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+            .accessibilityElement(children: .combine)
         }
     }
 
@@ -314,6 +371,8 @@ extension AdmissionState {
         case .blocked(.unreachable): "Waiting for Nestor"
         case .blocked(.revoked): "Not taking tasks"
         case .blocked(.reconciling): "Starting"
+        case .blocked(.awaitingConfirmation): "Not taking tasks"
+        case .blocked(.pausedOnNestor): "Paused on Nestor"
         }
     }
 
@@ -325,6 +384,8 @@ extension AdmissionState {
         case .blocked(.unreachable): "Nestor cannot be reached. Running tasks continue."
         case .blocked(.revoked): "The association was revoked in Nestor."
         case .blocked(.reconciling): "The service is checking the runners it left running."
+        case .blocked(.awaitingConfirmation): "Confirm the Nestor account above first."
+        case .blocked(.pausedOnNestor): "An administrator paused this machine on the Nestor web app. Running tasks finish."
         }
     }
 

@@ -80,6 +80,9 @@ public protocol RunnerService: Sendable {
     func associate() async throws -> NestorConnection
     /// Abandons an association in progress.
     func cancelAssociation() async throws -> NestorConnection
+    /// The owner's answer to the account Nestor approved the machine for (`.confirming`):
+    /// accepted, the machine takes tasks; refused, it disassociates itself.
+    func confirmAssociation(accept: Bool) async throws -> NestorConnection
     /// Ends the association. Call it only after the user confirmed: it ends the tasks running
     /// on this machine and erases its credentials, even if Nestor cannot be reached.
     func disassociate() async throws -> NestorConnection

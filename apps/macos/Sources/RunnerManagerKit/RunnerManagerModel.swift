@@ -144,6 +144,20 @@ public final class RunnerManagerModel {
         }
     }
 
+    /// The owner's answer to the Nestor account shown (M1): accepted, the machine takes tasks;
+    /// refused, it disassociates itself and erases its credentials.
+    public func confirmAssociation(accept: Bool) async {
+        do {
+            connection = .loaded(try await service.confirmAssociation(accept: accept))
+            async let statusResult = capture { try await self.service.machineStatus() }
+            async let runnersResult = capture { try await self.service.runners() }
+            status = await statusResult
+            runners = await runnersResult
+        } catch {
+            actionError = Self.message(for: error)
+        }
+    }
+
     /// Ends the association, after the user confirmed: running tasks end, credentials are erased.
     public func disassociate() async {
         do {

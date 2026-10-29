@@ -20,6 +20,9 @@ private actor GatedRunnerService: RunnerService {
     func connection() async throws -> NestorConnection { try await demo.connection() }
     func associate() async throws -> NestorConnection { try await demo.associate() }
     func cancelAssociation() async throws -> NestorConnection { try await demo.cancelAssociation() }
+    func confirmAssociation(accept: Bool) async throws -> NestorConnection {
+        try await demo.confirmAssociation(accept: accept)
+    }
     func disassociate() async throws -> NestorConnection { try await demo.disassociate() }
     func machineStatus() async throws -> MachineStatus { try await demo.machineStatus() }
     func setMode(_ mode: AdmissionMode, expectedRevision: Int) async throws -> MachineStatus {

@@ -134,6 +134,15 @@ impl StoredState {
                     return Err("associated without a machine id".into());
                 }
             }
+            Connection::Confirming { instance, account_email, approved_by_email } => {
+                if !valid_text(instance, 253) || !valid_text(account_email, 320) || !valid_text(approved_by_email, 320)
+                {
+                    return Err("invalid association to confirm".into());
+                }
+                if self.machine_id.is_none() {
+                    return Err("associated without a machine id".into());
+                }
+            }
             Connection::Associating { .. } => return Err("an association in progress is never stored".into()),
         }
         let mut ids = std::collections::BTreeSet::new();

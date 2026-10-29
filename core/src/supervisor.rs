@@ -151,8 +151,10 @@ struct Inner {
     load: Option<LoadSample>,
     last_admission: Admission,
     last_queue: Option<Queue>,
-    /// Nestor announced `capabilities.scope_filter` (S6): the requested ceiling applies.
-    scope_filter: bool,
+    /// What Nestor announced it enforces, and the leases its administrator set (S5, S6).
+    server: ServerTerms,
+    /// What the last jobs told of Claude Code's sign-in (A7).
+    claude: ClaudeSignIn,
     /// A runner exited 77 (credential refused): nothing is launched until the connection changes.
     credential_refused: bool,
     /// The last save failed (why); cleared by the next one that succeeds.
@@ -177,6 +179,12 @@ impl From<Denied> for ServiceError {
             Denied::Blocked(BlockReason::Revoked) => ServiceError::Revoked,
             Denied::Blocked(BlockReason::Unreachable) => ServiceError::Unreachable,
             Denied::Blocked(BlockReason::Reconciling) => ServiceError::Unavailable("The service is starting.".into()),
+            Denied::Blocked(BlockReason::AwaitingConfirmation) => {
+                ServiceError::Unavailable("Confirm the Nestor account on this machine first.".into())
+            }
+            Denied::Blocked(BlockReason::PausedOnNestor) => {
+                ServiceError::Unavailable("An administrator paused this machine on Nestor.".into())
+            }
             Denied::AtCapacity { live, ceiling } => {
                 ServiceError::Unavailable(format!("{live} of {ceiling} runners already running."))
             }
@@ -214,7 +222,8 @@ impl Supervisor {
             Some(path) => format!("{error} (kept as {}); started paused with 1 task at a time", path.display()),
             None => format!("{error}; started paused with 1 task at a time"),
         });
-        let mut regulator = Regulator::new(stored.mode, effective_ceiling(stored.max_concurrent_tasks, false));
+        let mut regulator =
+            Regulator::new(stored.mode, effective_ceiling(stored.max_concurrent_tasks, &ServerTerms::default()));
         regulator.set_blocked(Some(BlockReason::Reconciling));
         let slots = stored
             .runners
@@ -233,7 +242,8 @@ impl Supervisor {
                 load: None,
                 last_admission: Admission::Blocked(BlockReason::Reconciling),
                 last_queue: None,
-                scope_filter: false,
+                server: ServerTerms::default(),
+                claude: ClaudeSignIn::Unknown,
                 credential_refused: false,
                 save_error: None,
             }),
@@ -397,7 +407,15 @@ impl Supervisor {
         self.drain_surplus(&mut inner, Some(queue));
 
         let live = Self::live_scopes(&inner);
-        let plan = match inner.regulator.plan(&live, queue) {
+        // A runner launched and not yet holding a job will claim one of the eligible jobs: the
+        // count Nestor gives sizes the launches only beyond those (S4).
+        let mut offered = queue.clone();
+        for slot in inner.slots.values().filter(|s| s.state.is_live() && s.task_ref.is_none()) {
+            if let Some(eligible) = slot.record.scope.as_ref().and_then(|scope| offered.eligible.get_mut(scope)) {
+                *eligible = eligible.saturating_sub(1);
+            }
+        }
+        let plan = match inner.regulator.plan(&live, &offered) {
             Ok(plan) => plan,
             Err(_) => return,
         };
@@ -483,6 +501,25 @@ impl Supervisor {
     /// never claims twice. A job reported outside the runner's scope is a violation (B1(b)): it
     /// is reported and nothing more is launched until that runner ends. Contract v1 reports no
     /// scope (`scope` is `None`): only Nestor can tell, at claim time (S6).
+    /// The runner said why its job failed (`finished.failure`). `claude_not_signed_in`: Claude
+    /// Code has no token on this machine, and every job fails until its user keeps one with
+    /// `nestor-runner claude-token set` (A7). The service never holds that token.
+    pub fn runner_failed_job(&self, runner_id: &str, generation: u64, failure: &str) {
+        let mut inner = self.lock();
+        if Self::current(&inner, runner_id, generation).is_err() {
+            return;
+        }
+        if failure == "claude_not_signed_in" {
+            inner.claude = ClaudeSignIn::NotSignedIn;
+            self.log(
+                &mut inner,
+                runner_id,
+                LogLevel::Warning,
+                "Claude Code is not signed in on this machine: run `nestor-runner claude-token set` in a terminal of this user's session.".into(),
+            );
+        }
+    }
+
     pub fn runner_claimed(
         &self,
         runner_id: &str,
@@ -602,6 +639,9 @@ impl Supervisor {
                 }
                 RunnerExit::Idle | RunnerExit::Vanished => TaskOutcome::Unknown,
             };
+            if outcome == TaskOutcome::Succeeded {
+                inner.claude = ClaudeSignIn::SignedIn;
+            }
             if let Some(task) = &task_ref {
                 let level = if outcome == TaskOutcome::Succeeded { LogLevel::Info } else { LogLevel::Warning };
                 self.log(inner, runner_id, level, format!("Task {task} ended: {}.", outcome_text(outcome)));
@@ -711,14 +751,14 @@ impl Supervisor {
         }
         let previous = inner.stored.max_concurrent_tasks;
         inner.stored.max_concurrent_tasks = value;
-        let effective = effective_ceiling(value, inner.scope_filter);
+        let effective = effective_ceiling(value, &inner.server);
         inner.regulator.set_ceiling(effective);
         // Lowering is the safe direction: applied even if it cannot be saved.
         let safe = value <= previous;
         if let Err(error) = self.config_changed(&mut inner, safe) {
             if !safe {
                 inner.stored.max_concurrent_tasks = previous;
-                let effective = effective_ceiling(previous, inner.scope_filter);
+                let effective = effective_ceiling(previous, &inner.server);
                 inner.regulator.set_ceiling(effective);
             }
             return Err(not_saved(&error, safe));
@@ -733,15 +773,26 @@ impl Supervisor {
     /// What Nestor announced it enforces. Without `scope_filter` (S6) the ceiling applied is 1:
     /// several tasks side by side need the server to keep workspaces apart at claim time.
     pub fn set_scope_filter(&self, scope_filter: bool) {
+        let terms = ServerTerms { scope_filter, ..self.lock().server };
+        self.set_server_terms(terms);
+    }
+
+    /// What the last heartbeat or queue answer said: capabilities, the administrator's limit and
+    /// pause. The ceiling applied follows; nothing running is interrupted.
+    pub fn set_server_terms(&self, terms: ServerTerms) {
         let mut inner = self.lock();
-        if inner.scope_filter == scope_filter {
+        if inner.server == terms {
             return;
         }
-        inner.scope_filter = scope_filter;
-        let effective = effective_ceiling(inner.stored.max_concurrent_tasks, scope_filter);
+        inner.server = terms;
+        let effective = effective_ceiling(inner.stored.max_concurrent_tasks, &terms);
         inner.regulator.set_ceiling(effective);
         self.refresh_admission(&mut inner);
         self.drain_surplus(&mut inner, None);
+    }
+
+    pub fn server_terms(&self) -> ServerTerms {
+        self.lock().server
     }
 
     pub fn set_connection(&self, connection: Connection) {
@@ -788,6 +839,9 @@ impl Supervisor {
         let mut inner = self.lock();
         self.set_connection_locked(&mut inner, connection);
         inner.stored.machine_id = None;
+        inner.server = ServerTerms::default();
+        let effective = effective_ceiling(inner.stored.max_concurrent_tasks, &inner.server);
+        inner.regulator.set_ceiling(effective);
         let ids: Vec<RunnerId> = inner.slots.keys().cloned().collect();
         let now = self.now();
         for id in ids {
@@ -1215,9 +1269,13 @@ impl Supervisor {
         } else {
             match inner.stored.connection {
                 Connection::NotAssociated | Connection::Associating { .. } => Some(BlockReason::NotAssociated),
+                Connection::Confirming { .. } => Some(BlockReason::AwaitingConfirmation),
                 Connection::Unreachable { .. } => Some(BlockReason::Unreachable),
                 Connection::Revoked => Some(BlockReason::Revoked),
                 Connection::Associated { .. } if inner.credential_refused => Some(BlockReason::Revoked),
+                Connection::Associated { .. } if inner.server.paused_by_administrator => {
+                    Some(BlockReason::PausedOnNestor)
+                }
                 Connection::Associated { .. } => None,
             }
         };
@@ -1332,6 +1390,7 @@ impl Supervisor {
             active_scope: Regulator::active_scope(&Self::live_scopes(inner)).ok().flatten(),
             active_tasks,
             load: inner.load.clone(),
+            claude: inner.claude,
             config_error: match &inner.save_error {
                 Some(error) => Some(self.redactor.mask(&format!(
                     "The settings could not be saved ({error}); changes since then will be lost if the service restarts."
@@ -1378,11 +1437,26 @@ fn not_saved(error: &str, applied: bool) -> ServiceError {
     })
 }
 
-/// The ceiling actually applied: the requested one only once Nestor filters scopes at claim
-/// time (`capabilities.scope_filter`, S6); 1 until then (KCA-734 §3).
-pub fn effective_ceiling(requested: u32, scope_filter: bool) -> u32 {
-    if scope_filter {
-        requested.max(1)
+/// What Nestor says it applies to the machine (heartbeat and queue answers, S5, S6).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServerTerms {
+    /// `capabilities.scope_filter`: the claim never hands out a job of another scope.
+    pub scope_filter: bool,
+    /// `capabilities.release`: a runner may give back a job it must not run.
+    pub release: bool,
+    /// `leases.administrator_max`: the limit an administrator set on the web app.
+    pub administrator_max: Option<u32>,
+    /// `leases.paused_by_administrator`.
+    pub paused_by_administrator: bool,
+}
+
+/// The ceiling actually applied: the requested one, within the administrator's limit, only once
+/// Nestor filters scopes at claim time (`capabilities.scope_filter`, S6); 1 until then
+/// (KCA-734 §3). The service still passes no `--scope`: the server keeps one scope at a time on
+/// the machine (A2), and the local pinning of runners to one scope is good faith on top.
+pub fn effective_ceiling(requested: u32, server: &ServerTerms) -> u32 {
+    if server.scope_filter {
+        requested.min(server.administrator_max.unwrap_or(requested)).max(1)
     } else {
         1
     }

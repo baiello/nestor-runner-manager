@@ -31,8 +31,30 @@ import Testing
             try await demo.addRunner(NewRunnerRequest(name: "first"))
         }
         _ = try await demo.associate()
+        // Approved, not confirmed: still nothing (M1).
+        await #expect(throws: RunnerServiceError.self) {
+            try await demo.addRunner(NewRunnerRequest(name: "first"))
+        }
+        _ = try await demo.confirmAssociation(accept: true)
         let runner = try await demo.addRunner(NewRunnerRequest(name: "first"))
         #expect(runner.state == .ready)
+    }
+
+    @Test func theOwnerConfirmsTheAccountOrTheMachineIsDisassociated() async throws {
+        let demo = service(.notAssociated)
+        guard case .confirming(_, let account, let approver) = try await demo.associate() else {
+            Issue.record("expected the account to confirm")
+            return
+        }
+        #expect(account == "o***r@example.com" && approver == "a***n@example.com")
+        #expect(try await demo.machineStatus().admission == .blocked(.awaitingConfirmation))
+        #expect(try await demo.confirmAssociation(accept: false) == .notAssociated)
+        await #expect(throws: RunnerServiceError.self) { try await demo.confirmAssociation(accept: true) }
+    }
+
+    @Test func aJobWithoutClaudeSignedInShowsOnTheMachine() async throws {
+        #expect(try await service(.claudeNotSignedIn).machineStatus().claude == .notSignedIn)
+        #expect(try await service().machineStatus().claude == .unknown)
     }
 
     @Test func addedRunnerCanStayStopped() async throws {

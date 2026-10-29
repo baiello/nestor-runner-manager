@@ -19,11 +19,12 @@
 //! be ours byte for byte.
 //!
 //! The fake Nestor plays both sides of the server:
-//! - for the **service** ([`NestorApi`]), the association, the queue and the runner credentials,
-//!   each refused without a valid proof of possession of the machine key: signed by the key the
-//!   machine associated with, fresh (±60 s of the server's clock), never accepted twice (the
-//!   nonce: a proof seen once is spent), and bound to its request (operation and subject: the
-//!   runner the credential is for);
+//! - for the **service** ([`NestorApi`]), the association, its confirmation (M1), the heartbeat,
+//!   the queue and the runner tokens, each refused without a valid proof `nestor-machine-proof/v2`
+//!   of the machine key, checked as nestor checks it ([`FakeNestor`]): signed by the key the
+//!   machine associated with, for this API's origin, the request's method, path and query, the
+//!   digest of its credential (or device code) and of its body, within 60 s of the server's
+//!   clock, and strictly after the last proof accepted for the machine;
 //! - for the **runner**, over HTTP on loopback, the routes of `/runner`: only tokens it issued to
 //!   a machine through a verified proof are accepted, each good for one claim (S2), all of them
 //!   refused once the machine is revoked.
@@ -45,12 +46,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use nestor_runner_core::association::Associator;
 use nestor_runner_core::mask::Redactor;
 use nestor_runner_core::model::*;
-use nestor_runner_core::nestor::{
-    ApiError, Capabilities, DeviceAuthorization, DevicePoll, DeviceRequest, FakeNestor, NestorApi, Proof,
-};
-use nestor_runner_core::persist::{FileStore, MemoryStore, RevocationRequest, Store};
+use nestor_runner_core::nestor::{proof_header, proof_message, FakeNestor, MachineRequest, MachineResponse, NestorApi};
+use nestor_runner_core::persist::{FileStore, MemoryStore, Store};
 use nestor_runner_core::process::{ProcessConfig, ProcessLauncher};
-use nestor_runner_core::secrets::{MachineKeyStore, MemoryKeyStore, MemorySecretStore, Secret, SecretStore};
+use nestor_runner_core::secrets::{MachineKey, MachineKeyStore, MemoryKeyStore, MemorySecretStore, SecretStore};
 use nestor_runner_core::supervisor::{Clock, Launcher, Options, Supervisor};
 use nestor_runner_core::sys;
 use serde_json::{json, Value};
@@ -119,93 +118,20 @@ fn now_ms() -> u64 {
 
 // MARK: Fake Nestor, the service's side
 
-/// Why the fake refused a proof.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Refused {
-    /// Not a signature of the message by the machine's key.
-    Invalid,
-    /// Signed more than 60 s away from the server's clock.
-    Stale,
-    /// Already accepted once.
-    Replayed,
-    /// Signed for another operation or another subject than the request's.
-    Unbound,
-}
-
-#[derive(Default)]
-struct Proofs {
-    /// Proofs accepted, by message: each is accepted once. Kept 120 s, twice the window.
-    seen: BTreeMap<String, u64>,
-    refused: Vec<Refused>,
-    accepted: u32,
-}
-
+/// The service's side of the server: [`FakeNestor`], which checks every proof exactly as nestor
+/// does (`nestor-machine-proof/v2`), on the real clock, with a poll interval of one second, no
+/// `scope_filter` announced, the jobs of [`Api`] as its queue, and the runner tokens it issues
+/// handed to the runner's side.
 struct ContractNestor {
     inner: FakeNestor,
     api: Arc<Api>,
-    proofs: Mutex<Proofs>,
-    /// The machine of each credential, and the key of each request of association.
-    machines: Mutex<BTreeMap<String, String>>,
-    device_keys: Mutex<BTreeMap<String, Vec<u8>>>,
 }
 
 impl ContractNestor {
     fn new(api: Arc<Api>) -> Arc<Self> {
         let inner = FakeNestor::new(INSTANCE).auto_approve();
         inner.set_now(now_ms());
-        Arc::new(ContractNestor {
-            inner,
-            api,
-            proofs: Mutex::default(),
-            machines: Mutex::default(),
-            device_keys: Mutex::default(),
-        })
-    }
-
-    /// Fresh, never seen, bound to `operation` and `subject`, signed by `public_key`.
-    fn verify(&self, public_key: &[u8], proof: &Proof, operation: &str, subject: &str) -> Result<(), ApiError> {
-        let now = now_ms();
-        let mut proofs = self.proofs.lock().unwrap();
-        proofs.seen.retain(|_, at| now.saturating_sub(*at) <= 120_000);
-        let lines: Vec<&str> = proof.message.split('\n').collect();
-        let refused = match lines.as_slice() {
-            _ if !sys::verify_signature(public_key, proof.message.as_bytes(), &proof.signature) => {
-                Some(Refused::Invalid)
-            }
-            ["nestor-machine", op, sub, at] => match at.parse::<u64>() {
-                Err(_) => Some(Refused::Invalid),
-                Ok(_) if *op != operation || *sub != subject => Some(Refused::Unbound),
-                Ok(at) if now.abs_diff(at) > 60_000 => Some(Refused::Stale),
-                Ok(_) if proofs.seen.contains_key(&proof.message) => Some(Refused::Replayed),
-                Ok(_) => None,
-            },
-            _ => Some(Refused::Invalid),
-        };
-        match refused {
-            Some(reason) => {
-                proofs.refused.push(reason);
-                Err(ApiError::Rejected(format!("proof refused: {reason:?}")))
-            }
-            None => {
-                proofs.seen.insert(proof.message.clone(), now);
-                proofs.accepted += 1;
-                Ok(())
-            }
-        }
-    }
-
-    fn key_of(&self, credential: &Secret) -> Result<(String, Vec<u8>), ApiError> {
-        let machine = self.machines.lock().unwrap().get(credential.expose()).cloned();
-        let machine = machine.ok_or(ApiError::Rejected("unknown credential".into()))?;
-        if self.inner.is_revoked(&machine) {
-            return Err(ApiError::Revoked);
-        }
-        let key = self.inner.public_key_of(&machine).ok_or(ApiError::Rejected("unknown machine".into()))?;
-        Ok((machine, key))
-    }
-
-    fn refused(&self) -> Vec<Refused> {
-        self.proofs.lock().unwrap().refused.clone()
+        Arc::new(ContractNestor { inner, api })
     }
 
     /// An administrator revokes the machine on Nestor: its runner tokens die at once.
@@ -220,53 +146,29 @@ impl NestorApi for ContractNestor {
         INSTANCE.into()
     }
 
-    fn capabilities(&self) -> Capabilities {
-        // No scope filter yet (S6): the service passes no --scope and runs one task at a time.
-        Capabilities { scope_filter: false }
-    }
-
-    fn start_device_authorization(&self, request: &DeviceRequest) -> Result<DeviceAuthorization, ApiError> {
+    fn send(&self, request: &MachineRequest) -> Result<MachineResponse, String> {
         self.inner.set_now(now_ms());
-        let mut authorization = self.inner.start_device_authorization(request)?;
-        self.device_keys
-            .lock()
-            .unwrap()
-            .insert(authorization.device_code.expose().to_string(), request.public_key.clone());
-        // Poll every second rather than every five: the test waits for real.
-        authorization.interval_ms = 1_000;
-        Ok(authorization)
-    }
-
-    fn poll_device_authorization(&self, device_code: &Secret, proof: &Proof) -> Result<DevicePoll, ApiError> {
-        let key = self.device_keys.lock().unwrap().get(device_code.expose()).cloned();
-        let key = key.ok_or(ApiError::Rejected("unknown device code".into()))?;
-        self.verify(&key, proof, "poll", "device")?;
-        self.inner.set_now(now_ms());
-        let poll = self.inner.poll_device_authorization(device_code, proof)?;
-        if let DevicePoll::Approved { machine_id, credential } = &poll {
-            self.machines.lock().unwrap().insert(credential.expose().to_string(), machine_id.clone());
+        self.inner.set_queue(Queue::single(SCOPE, self.api.queued()));
+        let mut response = self.inner.send(request)?;
+        let mut body: Value = serde_json::from_slice(&response.body).unwrap_or(Value::Null);
+        match request.target.as_str() {
+            // Poll every second rather than every five: the test waits for real.
+            "/machine/authorizations" if response.status == 201 => {
+                body["interval"] = json!(1);
+                response.body = body.to_string().into_bytes();
+            }
+            "/machine/disassociate" if response.status == 204 => {
+                for machine in self.inner.revocations() {
+                    self.api.revoke_machine(&machine);
+                }
+            }
+            _ => {}
         }
-        Ok(poll)
-    }
-
-    fn queue(&self, credential: &Secret, proof: &Proof) -> Result<Queue, ApiError> {
-        let (_, key) = self.key_of(credential)?;
-        self.verify(&key, proof, "queue", "machine")?;
-        Ok(Queue::single(SCOPE, self.api.queued()))
-    }
-
-    fn issue_runner_credential(&self, credential: &Secret, proof: &Proof, runner_id: &str) -> Result<Secret, ApiError> {
-        let (machine, key) = self.key_of(credential)?;
-        self.verify(&key, proof, "runner-credential", runner_id)?;
-        let token = self.inner.issue_runner_credential(credential, proof, runner_id)?;
-        self.api.accept_token(token.expose(), &machine);
-        Ok(token)
-    }
-
-    fn revoke(&self, request: &RevocationRequest) -> Result<(), ApiError> {
-        self.inner.revoke(request)?;
-        self.api.revoke_machine(&request.machine_id);
-        Ok(())
+        if let Some(token) = body.get("token").and_then(Value::as_str) {
+            let machine = self.inner.machine_of_runner_token(token).expect("a token of a machine");
+            self.api.accept_token(token, &machine);
+        }
+        Ok(response)
     }
 }
 
@@ -691,7 +593,13 @@ impl Service {
     fn associate(&self) -> String {
         let connection = self.associator.associate(&machine()).unwrap();
         assert!(matches!(connection, Connection::Associating { .. }), "{connection:?}");
-        self.wait("the association", Duration::from_secs(10), |s| s.supervisor.connection().is_associated());
+        self.wait("the approval", Duration::from_secs(10), |s| {
+            matches!(s.supervisor.connection(), Connection::Confirming { .. })
+        });
+        // M1: nothing is created before the owner confirms the account on the machine.
+        assert!(self.supervisor.runners().is_empty());
+        self.associator.confirm(true).unwrap();
+        assert!(self.supervisor.connection().is_associated());
         self.supervisor.machine_id().unwrap()
     }
 
@@ -843,7 +751,15 @@ fn the_service_runs_the_real_runner_by_contract_v1() {
     for secret in credentials.iter().map(String::as_str).chain([SECRET_PROMPT, SECRET_TITLE]) {
         assert!(!visible.contains(secret), "{secret} is visible: {visible}");
     }
-    assert!(world.nestor.refused().is_empty(), "every proof was valid: {:?}", world.nestor.refused());
+    assert_eq!(world.nestor.inner.rejected_proofs(), 0, "every proof was valid");
+    assert_eq!(world.nestor.inner.stale_proofs(), 0, "every proof was signed after the last");
+    let times = world.nestor.inner.accepted_proofs();
+    assert!(times.windows(2).all(|w| w[0] < w[1]), "strictly increasing: {times:?}");
+    for heartbeat in world.nestor.inner.heartbeats(&machine_id) {
+        assert_eq!(heartbeat["service_mode"], "live");
+        assert_eq!(heartbeat["max_concurrent_tasks"], 1, "no scope filter announced: one at a time");
+    }
+    assert!(!world.nestor.inner.heartbeats(&machine_id).is_empty(), "the service sent its heartbeat");
     for claim in world.api.bodies("/claim") {
         let claim: Value = serde_json::from_str(&claim).unwrap();
         assert_eq!(claim["machine_id"], machine_id.as_str());
@@ -1167,44 +1083,77 @@ fn without_a_kept_claude_code_token_the_job_fails_not_the_runner() {
     }
     assert!(!world.witness.exists(), "Claude Code never ran");
     assert!(service.runner().failure_reason.is_none(), "{}", service.dump());
+    // `run-once` at nestor.rev reports `failed` without why: the machine cannot tell Claude Code
+    // is not signed in until the runner sends `finished.failure` (read ahead of the contract).
+    assert_eq!(service.supervisor.status().claude, ClaudeSignIn::Unknown);
 }
 
 // MARK: The fake applies the proof of possession
 
-/// Without this, the scenarios would prove nothing about the service's proofs: the fake refuses
-/// a proof replayed, stale, bound to another request or signed by another key, and the service's
+/// Without this, the scenarios would prove nothing about the service's proofs: the fake refuses,
+/// as nestor does, a proof replayed or signed no later than the last, out of the window, for
+/// another audience, method, target, credential or body, or by another key; and the service's
 /// own proofs pass.
 #[test]
 #[ignore = "needs the real runner: NESTOR_RUNNER_DIR=\"$(../scripts/nestor-runner.sh)\""]
 fn the_fake_nestor_applies_the_proof_of_possession() {
     let world = world(Wrap::Faithful);
     let service = world.service();
-    service.associate();
+    let machine_id = service.associate();
+    assert_eq!(world.nestor.inner.rejected_proofs() + world.nestor.inner.stale_proofs(), 0);
     let credential = world.secrets.get("machine-credential").unwrap().expect("credential");
     let key = world.keys.load().unwrap().expect("key");
-    let sign = |message: String| Proof { signature: key.sign(message.as_bytes()).unwrap(), message };
-    let issue = |proof: &Proof, runner: &str| world.nestor.issue_runner_credential(&credential, proof, runner);
-
-    let fresh = sign(Proof::message("runner-credential", "0123456789abcdef", now_ms()));
-    assert!(issue(&fresh, "0123456789abcdef").is_ok());
-    assert!(issue(&fresh, "0123456789abcdef").is_err(), "replayed");
-    let other_runner = sign(Proof::message("runner-credential", "0123456789abcdef", now_ms() + 1));
-    assert!(issue(&other_runner, "fedcba9876543210").is_err(), "bound to another runner");
-    let other_operation = sign(Proof::message("queue", "0123456789abcdef", now_ms() + 2));
-    assert!(issue(&other_operation, "0123456789abcdef").is_err(), "bound to another operation");
-    let stale = sign(Proof::message("runner-credential", "0123456789abcdef", now_ms() - 61_000));
-    assert!(issue(&stale, "0123456789abcdef").is_err(), "stale");
-    let future = sign(Proof::message("runner-credential", "0123456789abcdef", now_ms() + 61_000));
-    assert!(issue(&future, "0123456789abcdef").is_err(), "from the future");
     let stranger = MemoryKeyStore::new().create().unwrap();
-    let message = Proof::message("runner-credential", "0123456789abcdef", now_ms() + 3);
-    let forged = Proof { signature: stranger.sign(message.as_bytes()).unwrap(), message };
-    assert!(issue(&forged, "0123456789abcdef").is_err(), "another key");
-    let mut refused = world.nestor.refused();
-    refused.sort();
-    assert_eq!(
-        refused,
-        vec![Refused::Invalid, Refused::Stale, Refused::Stale, Refused::Replayed, Refused::Unbound, Refused::Unbound]
-    );
-    assert_eq!(world.nestor.inner.runner_credentials(&service.supervisor.machine_id().unwrap()).len(), 1);
+    let audience = format!("https://{INSTANCE}");
+    let body = b"{}".to_vec();
+    // Signs with `signer` what is given, then sends the request to /machine/runners.
+    let send =
+        |signer: &dyn MachineKey, audience: &str, method: &str, target: &str, secret: &str, signed: &[u8], at: u64| {
+            let message = proof_message(audience, method, target, at, Some(secret), signed);
+            let request = MachineRequest {
+                method: "POST",
+                target: "/machine/runners".into(),
+                body: body.clone(),
+                credential: Some(credential.clone()),
+                proof: proof_header(at, &signer.sign(&message).unwrap()),
+            };
+            let response = world.nestor.send(&request).unwrap();
+            (response.status, response.code())
+        };
+    let secret = credential.expose();
+    let invalid = (401, Some("invalid_machine_proof".to_string()));
+    let stale = (401, Some("stale_machine_proof".to_string()));
+    let t = now_ms();
+    assert_eq!(send(key.as_ref(), &audience, "POST", "/machine/runners", secret, &body, t).0, 201, "a fresh proof");
+    assert_eq!(send(key.as_ref(), &audience, "POST", "/machine/runners", secret, &body, t), stale, "replayed");
+    assert_eq!(send(key.as_ref(), &audience, "POST", "/machine/runners", secret, &body, t - 1), stale, "earlier");
+    for (what, response) in [
+        (
+            "another audience",
+            send(key.as_ref(), "https://other.test", "POST", "/machine/runners", secret, &body, t + 1),
+        ),
+        ("another method", send(key.as_ref(), &audience, "PUT", "/machine/runners", secret, &body, t + 2)),
+        ("another target", send(key.as_ref(), &audience, "POST", "/machine/queue", secret, &body, t + 3)),
+        ("another query", send(key.as_ref(), &audience, "POST", "/machine/runners?x=1", secret, &body, t + 4)),
+        (
+            "another credential",
+            send(key.as_ref(), &audience, "POST", "/machine/runners", "nestor_machine_other", &body, t + 5),
+        ),
+        ("another body", send(key.as_ref(), &audience, "POST", "/machine/runners", secret, b"{\"a\":1}", t + 6)),
+        ("another key", send(stranger.as_ref(), &audience, "POST", "/machine/runners", secret, &body, t + 7)),
+    ] {
+        assert_eq!(response, invalid, "{what}");
+    }
+    assert_eq!(send(key.as_ref(), &audience, "POST", "/machine/runners", secret, &body, now_ms() - 61_000), stale);
+    assert_eq!(send(key.as_ref(), &audience, "POST", "/machine/runners", secret, &body, now_ms() + 61_000), stale);
+    // A time far ahead recorded nothing; one just after the last still passes.
+    assert_eq!(send(key.as_ref(), &audience, "POST", "/machine/runners", secret, &body, t + 8).0, 201);
+    assert_eq!(world.nestor.inner.rejected_proofs(), 7);
+    assert_eq!(world.nestor.inner.stale_proofs(), 4);
+    assert_eq!(world.nestor.inner.runners_of(&machine_id).len(), 2);
+    // The service, right after: its own proofs pass, signed after the ones above.
+    std::thread::sleep(Duration::from_millis(50));
+    world.api.add_jobs(1, None);
+    service.wait("the job", Duration::from_secs(60), |s| s.outcomes().len() == 1);
+    assert_eq!(world.nestor.inner.rejected_proofs(), 7, "none of the service's was refused");
 }

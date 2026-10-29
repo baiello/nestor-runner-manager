@@ -19,7 +19,8 @@
 //!    `--allow-unsigned-clients` flag for development, which gives such peers `full` access and
 //!    is reported by `hello` (`peerVerification: "unsignedFallback"`) so the interface shows it.
 //!
-//! Sensitive operations (`disassociate`, raising the ceiling, `addRunner`, a forced `stop`) also
+//! Sensitive operations (`confirmAssociation`, `disassociate`, raising the ceiling, `addRunner`, a
+//! forced `stop`) also
 //! need `confirmed: true`, which the interface sends only after asking the user.
 //!
 //! The socket lives in a directory of the user's own (`~/Library/Application Support/…`, never a
@@ -87,6 +88,13 @@ pub enum Request {
     Connection,
     Associate,
     CancelAssociation,
+    /// The owner's answer to the account Nestor gave (M1): `accept` creates runners from now on;
+    /// a refusal disassociates the machine. Either needs `confirmed: true`.
+    ConfirmAssociation {
+        accept: bool,
+        #[serde(default)]
+        confirmed: bool,
+    },
     Disassociate {
         #[serde(default)]
         confirmed: bool,
@@ -363,6 +371,10 @@ impl Service {
                 self.associator.associate(&machine).map(|c| to_value(&c))
             }
             Request::CancelAssociation => Ok(to_value(&self.associator.cancel())),
+            Request::ConfirmAssociation { accept, confirmed } => {
+                confirm(confirmed, "the Nestor account this machine works for is confirmed by its owner")?;
+                self.associator.confirm(accept).map(|c| to_value(&c))
+            }
             Request::Disassociate { confirmed } => {
                 confirm(confirmed, "disassociating ends the tasks running on this machine")?;
                 Ok(to_value(&self.associator.disassociate()))

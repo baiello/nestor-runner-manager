@@ -107,6 +107,19 @@ fn valid_report_lines_are_read_and_invalid_ones_refused() {
         parse_report(r#"{"v":1,"type":"finished","outcome":"lease_lost"}"#),
         Ok(Report::Finished(Finished::LeaseLost))
     ));
+    // Read ahead of the contract (A7): why a job failed, on `failed` only.
+    assert_eq!(
+        parse_report(r#"{"v":1,"type":"finished","outcome":"failed","failure":"claude_not_signed_in"}"#),
+        Ok(Report::FailedWith { failure: "claude_not_signed_in".into() })
+    );
+    for invalid in [
+        r#"{"v":1,"type":"finished","outcome":"done","failure":"claude_not_signed_in"}"#,
+        r#"{"v":1,"type":"finished","outcome":"failed","failure":42}"#,
+        r#"{"v":1,"type":"finished","outcome":"failed","failure":"Not A Code"}"#,
+        r#"{"v":1,"type":"claimed","job_id":"j","failure":"x"}"#,
+    ] {
+        assert!(parse_report(invalid).is_err(), "{invalid}");
+    }
     let oversized = format!(r#"{{"v":1,"type":"claimed","job_id":"{}"}}"#, "j".repeat(process::MAX_REPORT_BYTES));
     assert!(parse_report(&oversized).is_err());
 }

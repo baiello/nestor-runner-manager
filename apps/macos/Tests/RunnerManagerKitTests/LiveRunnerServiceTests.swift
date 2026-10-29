@@ -100,6 +100,19 @@ import Testing
         }
     }
 
+    @Test func decodesTheAccountToConfirmAndClaudesSignIn() throws {
+        let reply = data(#"{"ok":true,"result":{"state":"confirming","instance":"nestor.example","accountEmail":"o***r@example.com","approvedByEmail":"a***n@example.com"}}"#)
+        #expect(try LiveRunnerService.decode(reply, as: Wire.Connection.self).model == .confirming(
+            instance: "nestor.example",
+            accountEmail: "o***r@example.com",
+            approvedByEmail: "a***n@example.com"
+        ))
+        let admission = data(#"{"ok":true,"result":{"state":"blocked","reason":"pausedOnNestor"}}"#)
+        #expect(try LiveRunnerService.decode(admission, as: Wire.Admission.self).model == .blocked(.pausedOnNestor))
+        let waiting = data(#"{"ok":true,"result":{"state":"blocked","reason":"awaitingConfirmation"}}"#)
+        #expect(try LiveRunnerService.decode(waiting, as: Wire.Admission.self).model == .blocked(.awaitingConfirmation))
+    }
+
     @Test func runnerNamesAreASCII() {
         #expect(throws: RunnerServiceError.self) { try RunnerNameRule.validate("caf\u{e9}") }
         #expect(throws: RunnerServiceError.self) { try RunnerNameRule.validate("runner\u{2010}1") }

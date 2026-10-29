@@ -14,6 +14,10 @@ public actor DemoRunnerService: RunnerService {
         case notAssociated
         /// Waiting for the (simulated) approval of the association on Nestor.
         case associating
+        /// Approved on (simulated) Nestor; the account waits for the owner's confirmation.
+        case confirming
+        /// Associated, but the last job failed: Claude Code is not signed in on this Mac.
+        case claudeNotSignedIn
         /// Every call fails, to show the error states.
         case unavailable
     }
@@ -44,7 +48,7 @@ public actor DemoRunnerService: RunnerService {
         self.now = now
         let start = now()
         switch scenario {
-        case .populated:
+        case .populated, .claudeNotSignedIn:
             connectionState = .associated(instance: Self.demoInstance, since: start.addingTimeInterval(-86_400 * 3))
             let seeded = Self.seedRunners(at: start)
             runnerList = seeded.map(\.runner)
@@ -66,8 +70,18 @@ public actor DemoRunnerService: RunnerService {
             )
             runnerList = []
             logsByRunner = [:]
+        case .confirming:
+            connectionState = Self.confirmingState
+            runnerList = []
+            logsByRunner = [:]
         }
     }
+
+    static let confirmingState = NestorConnection.confirming(
+        instance: demoInstance,
+        accountEmail: "o***r@example.com",
+        approvedByEmail: "a***n@example.com"
+    )
 
     // MARK: RunnerService
 
@@ -96,7 +110,17 @@ public actor DemoRunnerService: RunnerService {
 
     public func associate() async throws -> NestorConnection {
         try await simulateCall()
-        connectionState = .associated(instance: Self.demoInstance, since: now())
+        // The simulated Nestor approves at once; the owner still confirms the account (M1).
+        connectionState = Self.confirmingState
+        return connectionState
+    }
+
+    public func confirmAssociation(accept: Bool) async throws -> NestorConnection {
+        try await simulateCall()
+        guard case .confirming = connectionState else {
+            throw RunnerServiceError.unavailable("No association waits for a confirmation.")
+        }
+        connectionState = accept ? .associated(instance: Self.demoInstance, since: now()) : .notAssociated
         return connectionState
     }
 
@@ -229,6 +253,7 @@ public actor DemoRunnerService: RunnerService {
         let admission: AdmissionState = switch connectionState {
         case .associated: admissionMode == .paused ? .paused : .open
         case .notAssociated, .associating: .blocked(.notAssociated)
+        case .confirming: .blocked(.awaitingConfirmation)
         case .unreachable: .blocked(.unreachable)
         case .revoked: .blocked(.revoked)
         }
@@ -254,7 +279,8 @@ public actor DemoRunnerService: RunnerService {
                 memoryTotalBytes: 128 * Self.gib,
                 memoryPressure: .normal,
                 diskFreeBytes: 1_200 * Self.gib
-            )
+            ),
+            claude: scenario == .claudeNotSignedIn ? .notSignedIn : .unknown
         )
     }
 

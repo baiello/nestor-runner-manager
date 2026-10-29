@@ -99,6 +99,7 @@ impl ProcessConfig {
 
 struct Running {
     generation: u64,
+    pid: u32,
     /// The drain line is written here; dropping it closes the runner's standard input.
     control: Option<ChildStdin>,
 }
@@ -160,6 +161,11 @@ pub enum Report {
         job_id: String,
     },
     Finished(Finished),
+    /// `finished` `failed`, with why (`failure`, such as `claude_not_signed_in`). Read ahead of
+    /// the contract: `run-once` at `contract/nestor.rev` does not send it yet (A7).
+    FailedWith {
+        failure: String,
+    },
     Idle,
 }
 
@@ -182,8 +188,24 @@ pub fn parse_report(line: &str) -> Result<Report, String> {
         "idle" => &[],
         _ => return Err("unknown type".into()),
     };
-    if object.len() != fields.len() + 2 || !fields.iter().all(|f| object.contains_key(*f)) {
+    // `failure`, on a failed job only, is read ahead of the contract (A7).
+    let failure = match object.get("failure") {
+        Some(failure) if kind == "finished" && object.get("outcome").and_then(Value::as_str) == Some("failed") => {
+            let failure = failure.as_str().ok_or("failure is not a string")?;
+            if failure.is_empty() || failure.len() > 64 || !failure.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+            {
+                return Err("invalid failure".into());
+            }
+            Some(failure.to_string())
+        }
+        _ => None,
+    };
+    let extra = usize::from(failure.is_some());
+    if object.len() != fields.len() + 2 + extra || !fields.iter().all(|f| object.contains_key(*f)) {
         return Err(format!("fields of {kind} do not match"));
+    }
+    if let Some(failure) = failure {
+        return Ok(Report::FailedWith { failure });
     }
     let text = |name: &str| object[name].as_str().ok_or_else(|| format!("{name} is not a string"));
     let number = |name: &str| object[name].as_u64().ok_or_else(|| format!("{name} is not a number"));
@@ -348,6 +370,17 @@ impl ProcessLauncher {
         let value_of = |flag: &str| arguments.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone());
         value_of("--runner-id").as_deref() == Some(runner.id.as_str())
             && value_of("--generation") == Some(runner.generation.to_string())
+    }
+
+    /// A child this launcher spawned and has not reaped yet: its pid cannot be anyone else's, so
+    /// it is the runner whatever its argv became. Adopted runners are not children, and need the
+    /// marker.
+    fn is_unreaped_child(&self, runner: &RunnerRecord, pid: u32) -> bool {
+        self.running
+            .lock()
+            .unwrap()
+            .get(&runner.id)
+            .is_some_and(|running| running.generation == runner.generation && running.pid == pid)
     }
 
     /// Sweeps what the runner left behind, then reports what survived (M3).
@@ -574,7 +607,8 @@ impl Launcher for ProcessLauncher {
 
     fn is_alive(&self, runner: &RunnerRecord) -> bool {
         let (Some(pid), Some(start_time_us)) = (runner.pid, runner.start_time_us) else { return false };
-        ProcessIdentity { pid, start_time_us }.is_current() && Self::carries_marker(pid, runner)
+        ProcessIdentity { pid, start_time_us }.is_current()
+            && (self.is_unreaped_child(runner, pid) || Self::carries_marker(pid, runner))
     }
 
     fn forget(&self, runner_id: &str) {
@@ -655,7 +689,7 @@ impl PendingLaunch for Pending {
             });
         }
         let control = child.stdin.take();
-        self.running.lock().unwrap().insert(id.clone(), Running { generation, control });
+        self.running.lock().unwrap().insert(id.clone(), Running { generation, pid, control });
         let running = Arc::clone(&self.running);
         let redactor = self.redactor.clone();
         std::thread::spawn(move || {
@@ -763,6 +797,17 @@ fn read_reports(
             }
             Some(Report::Finished(finished)) if hello && reported.claimed.load(Ordering::SeqCst) => {
                 reported.finished.lock().unwrap().get_or_insert(finished);
+            }
+            Some(Report::FailedWith { failure }) if hello && reported.claimed.load(Ordering::SeqCst) => {
+                let first = {
+                    let mut finished = reported.finished.lock().unwrap();
+                    let first = finished.is_none();
+                    finished.get_or_insert(Finished::Failed);
+                    first
+                };
+                if first {
+                    supervisor.runner_failed_job(runner_id, generation, &failure);
+                }
             }
             Some(Report::Idle) if hello => {}
             _ => ignored += 1,

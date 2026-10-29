@@ -31,7 +31,8 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 const FIXTURE: &str = include_str!("../../contract/run-once-v1.json");
-const DOUBLE_VALUED: [&str; 7] = [
+const DOUBLE_VALUED: [&str; 8] = [
+    "--double-failure",
     "--double-claim",
     "--double-job-ms",
     "--double-finish",
@@ -40,7 +41,8 @@ const DOUBLE_VALUED: [&str; 7] = [
     "--double-hello-generation",
     "--double-connect",
 ];
-const DOUBLE_FLAGS: [&str; 4] = ["--double-hostile", "--double-deaf", "--double-tree", "--double-mark-credential"];
+const DOUBLE_FLAGS: [&str; 5] =
+    ["--double-hostile", "--double-deaf", "--double-tree", "--double-mark-credential", "--double-exec-sleep"];
 
 fn usage(reason: &str) -> ! {
     eprintln!("contract-argv=refused {reason}");
@@ -284,6 +286,12 @@ fn main() {
     if double.contains_key("--double-tree") {
         spawn_tree();
     }
+    if double.contains_key("--double-exec-sleep") {
+        // Becomes another program: same pid, an argv without the launch's marker.
+        use std::os::unix::process::CommandExt;
+        let error = std::process::Command::new("/bin/sleep").arg("30").exec();
+        usage(&format!("exec: {error}"));
+    }
     if double.contains_key("--double-hostile") {
         report(&mut out, &format!(r#"{{"v":1,"type":"idle","pad":"{}"}}"#, "x".repeat(10_000)));
         report(&mut out, r#"{"v":1,"type":"scope","scope":"other"}"#);
@@ -312,7 +320,13 @@ fn main() {
         eprintln!("job done, drained-meanwhile={}", drained.load(Ordering::SeqCst));
         if !double.contains_key("--double-hostile") {
             let outcome = option("--double-finish").unwrap_or_else(|| "done".into());
-            report(&mut out, &format!(r#"{{"v":1,"type":"finished","outcome":"{outcome}"}}"#));
+            match option("--double-failure") {
+                Some(failure) => report(
+                    &mut out,
+                    &format!(r#"{{"v":1,"type":"finished","outcome":"{outcome}","failure":"{failure}"}}"#),
+                ),
+                None => report(&mut out, &format!(r#"{{"v":1,"type":"finished","outcome":"{outcome}"}}"#)),
+            }
         }
         return;
     }

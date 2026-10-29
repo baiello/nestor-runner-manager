@@ -38,6 +38,10 @@ public enum NestorConnection: Equatable, Sendable {
     /// Waiting for an administrator to approve this machine on the Nestor web app with
     /// `userCode`. The code alone grants nothing; nothing secret is shown or typed here.
     case associating(instance: String, userCode: String, verificationURL: String, expiresAt: Date)
+    /// Approved on Nestor for the account `accountEmail`, by `approvedByEmail`, both masked by
+    /// Nestor. Nothing runs until the owner confirms them here: someone who saw the code and
+    /// typed it first would otherwise get the machine (M1).
+    case confirming(instance: String, accountEmail: String, approvedByEmail: String)
     case associated(instance: String, since: Date)
     case unreachable(instance: String, reason: String)
     /// The association was revoked in Nestor; associate again to take tasks.
@@ -162,6 +166,19 @@ public enum AdmissionBlock: String, Equatable, Sendable {
     case revoked
     /// The service has just started and is still checking the runners it left running.
     case reconciling
+    /// Nestor approved the machine; the account is not confirmed on this Mac yet.
+    case awaitingConfirmation
+    /// An administrator paused the machine on the Nestor web app.
+    case pausedOnNestor
+}
+
+/// Whether Claude Code is signed in for this machine's runners, as their jobs tell. The service
+/// never holds Claude Code's token: the Mac's user keeps it once with
+/// `nestor-runner claude-token set`.
+public enum ClaudeSignIn: String, Equatable, Sendable {
+    case unknown
+    case notSignedIn
+    case signedIn
 }
 
 /// Whether the service accepts new tasks right now.
@@ -242,6 +259,8 @@ public struct MachineStatus: Equatable, Sendable {
     public var load: MachineLoad?
     /// Set when the service could not read its stored settings and started paused instead.
     public var configError: String?
+    /// A job failed because Claude Code is not signed in on this Mac.
+    public var claude: ClaudeSignIn
 
     public init(
         serviceMode: ServiceMode,
@@ -254,7 +273,8 @@ public struct MachineStatus: Equatable, Sendable {
         activeTasks: [ActiveTask],
         load: MachineLoad?,
         configError: String? = nil,
-        effectiveMaxConcurrentTasks: Int? = nil
+        effectiveMaxConcurrentTasks: Int? = nil,
+        claude: ClaudeSignIn = .unknown
     ) {
         self.serviceMode = serviceMode
         self.mode = mode
@@ -267,6 +287,7 @@ public struct MachineStatus: Equatable, Sendable {
         self.activeTasks = activeTasks
         self.load = load
         self.configError = configError
+        self.claude = claude
     }
 
     /// The requested value is above what the server allows for now.

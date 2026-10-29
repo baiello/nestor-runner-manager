@@ -23,3 +23,5 @@ Any change of the contract:
 1. in nestor, changes `contract` and the runner; its contract job then fails, the fixtures no longer being this copy;
 2. here, one pull request copies `contract/run-once-v1.json` unchanged, pins its commit in `nestor.rev`, adapts the service, and passes the contract test locally;
 3. in nestor, `contract/runner-manager.rev` pins that commit of this repository, and the contract job passes.
+
+**Read ahead of the contract (A7, KCA-749).** The service also accepts, on a `finished` report of outcome `failed` only, a `failure` code (`[a-z_]{1,64}`), such as `claude_not_signed_in`, to show that Claude Code is not signed in on the machine. `run-once` at `nestor.rev` does not send it: it needs a change of the contract in nestor (fixtures and runner) before it shows anything with the real runner.

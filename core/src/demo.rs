@@ -102,5 +102,10 @@ impl DemoQueue {
             }
         }
         self.nestor.set_queue(self.queue());
+        // A simulated server of nestor #157: scope filter announced, an administrator limit of 4.
+        self.nestor.set_scope_filter(true);
+        if let Some(machine_id) = self.supervisor.machine_id() {
+            self.nestor.set_administrator_limits(&machine_id, 4, false);
+        }
     }
 }

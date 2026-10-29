@@ -30,6 +30,8 @@ enum Snapshots {
             ("08-service-unavailable", AnyView(ContentView(model: loadedModel(.unavailable))), size),
             ("09-loading", AnyView(ContentView(model: RunnerManagerModel(service: DemoRunnerService(latency: .seconds(3600))))), size),
             ("12-associating", AnyView(ContentView(model: loadedModel(.associating))), tall),
+            ("13-confirming", AnyView(ContentView(model: loadedModel(.confirming))), tall),
+            ("14-claude-not-signed-in", AnyView(ContentView(model: loadedModel(.claudeNotSignedIn))), tall),
         ]
 
         for (name, view, size) in scenes {

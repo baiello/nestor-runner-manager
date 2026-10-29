@@ -263,6 +263,70 @@ fn the_reported_outcome_is_kept_and_a_failed_job_is_not_a_crash() {
     wait_on(&released, "the release", || finished_with(&released, TaskOutcome::Released));
 }
 
+/// A7: a job that failed `claude_not_signed_in` says so in the machine's status; a job that
+/// succeeds afterwards clears it. The failure is read ahead of contract v1 (`finished.failure`).
+#[test]
+fn a_job_without_claude_code_signed_in_shows_on_the_machine() {
+    let setup = setup(&[
+        "--double-claim",
+        "t-1",
+        "--double-job-ms",
+        "50",
+        "--double-finish",
+        "failed",
+        "--double-failure",
+        "claude_not_signed_in",
+    ]);
+    assert_eq!(setup.supervisor.status().claude, ClaudeSignIn::Unknown);
+    setup.supervisor.tick(&Queue::single("scope-a", 1));
+    let runner = setup.supervisor.runners().remove(0);
+    wait_on(&setup, "the failed job", || finished_with(&setup, TaskOutcome::Failed));
+    assert_eq!(setup.supervisor.status().claude, ClaudeSignIn::NotSignedIn);
+    assert!(logs(&setup, &runner.id).contains("claude-token set"), "{}", dump(&setup));
+    assert!(setup.supervisor.runner(&runner.id).unwrap().failure_reason.is_none(), "a failed job, not a crash");
+
+    // Another failure is not Claude Code's.
+    let other = self::setup(&[
+        "--double-claim",
+        "t-2",
+        "--double-job-ms",
+        "50",
+        "--double-finish",
+        "failed",
+        "--double-failure",
+        "invalid_commit_author",
+    ]);
+    other.supervisor.tick(&Queue::single("scope-a", 1));
+    wait_on(&other, "the failed job", || finished_with(&other, TaskOutcome::Failed));
+    assert_eq!(other.supervisor.status().claude, ClaudeSignIn::Unknown);
+
+    let done = self::setup(&["--double-claim", "t-3", "--double-job-ms", "50"]);
+    done.supervisor.tick(&Queue::single("scope-a", 1));
+    wait_on(&done, "the job", || finished_with(&done, TaskOutcome::Succeeded));
+    assert_eq!(done.supervisor.status().claude, ClaudeSignIn::SignedIn);
+}
+
+/// A child the launcher has not reaped is the runner whatever its argv became: `terminate`
+/// reaches it (KCA-737 nº3).
+#[test]
+fn terminate_reaches_a_direct_child_whose_argv_changed() {
+    let setup = setup(&["--double-exec-sleep"]);
+    setup.supervisor.tick(&Queue::single("scope-a", 1));
+    wait_on(&setup, "the hello", || setup.supervisor.runners().iter().any(|r| r.state == RunnerState::Ready));
+    let runner = setup.supervisor.runners().remove(0);
+    let pid = setup.supervisor.runner_pids()[0];
+    let identity = sys::ProcessIdentity::of(pid).unwrap();
+    wait_or(
+        "the exec",
+        &mut || sys::process_arguments(pid).is_some_and(|a| a.iter().any(|p| p.ends_with("sleep"))),
+        &|| dump(&setup),
+    );
+    assert!(!sys::process_arguments(pid).unwrap().iter().any(|a| a == "--runner-id"), "the marker is gone");
+    setup.supervisor.end_association(Connection::Revoked);
+    wait_on(&setup, "the runner to be gone", || setup.supervisor.runner(&runner.id).is_none());
+    assert!(!identity.is_current(), "the child was terminated");
+}
+
 #[test]
 fn a_refused_credential_stops_launches_without_restarting() {
     let setup = setup(&["--double-exit", "77"]);

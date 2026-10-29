@@ -83,6 +83,10 @@ pub enum BlockReason {
     Revoked,
     /// The service has just started and is still adopting or clearing the runners it left.
     Reconciling,
+    /// Nestor approved the machine; its owner has not confirmed the account here yet (M1).
+    AwaitingConfirmation,
+    /// An administrator paused the machine on the Nestor web app: its runners claim nothing.
+    PausedOnNestor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,6 +111,16 @@ pub enum Connection {
         user_code: String,
         verification_uri: String,
         expires_at_ms: u64,
+    },
+    /// Nestor approved the machine and gave its credential, for the account `account_email`,
+    /// approved by `approved_by_email`, both masked by Nestor (`o***r@example.com`). No runner is
+    /// created until the owner confirms them on this machine: someone who saw the code and typed
+    /// it first in their own account would otherwise get the machine (M1 of KCA-738).
+    #[serde(rename_all = "camelCase")]
+    Confirming {
+        instance: String,
+        account_email: String,
+        approved_by_email: String,
     },
     #[serde(rename_all = "camelCase")]
     Associated {
@@ -240,6 +254,22 @@ pub struct MachineStatus {
     /// Set when the stored configuration could not be read: the service then starts paused with
     /// a ceiling of 1.
     pub config_error: Option<String>,
+    /// Whether the runners can run Claude Code, as their jobs tell (A7).
+    pub claude: ClaudeSignIn,
+}
+
+/// Whether Claude Code is signed in for the runners of this machine. The service never holds
+/// Claude Code's token: the machine's user keeps it once with `nestor-runner claude-token set`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ClaudeSignIn {
+    /// No job told yet.
+    #[default]
+    Unknown,
+    /// A job failed `claude_not_signed_in`: every job fails until the token is kept.
+    NotSignedIn,
+    /// A job ran Claude Code since.
+    SignedIn,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

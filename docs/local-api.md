@@ -2,7 +2,7 @@
 
 The interfaces reach the runner service (`core/`, binary `nestor-runner-service`) through this API. It follows the architecture contract (KCA-717 §4, revised by contract v2 in KCA-724 and the security review KCA-727). The macOS client is `LiveRunnerService`; the Rust server is `core/src/ipc.rs`. Security design and test evidence: [security.md](security.md).
 
-Changes from 1.0: access levels by code signature, `confirmed` on sensitive operations, `cancelAssociation`, the `associating` connection, `liveRunners` and `activeScope` in the status, `scope` on runners, the `scope.violation` event, the `confirmationRequired` error, one-job runners (no admission token). Added in 1.1 without a version change (fields a client may ignore): `effectiveMaxConcurrentTasks` and `cappedByServer` in the status, the `leaseLost` and `released` outcomes, the places reserved for `full` access and the request delays.
+Changes from 1.0: access levels by code signature, `confirmed` on sensitive operations, `cancelAssociation`, the `associating` connection, `liveRunners` and `activeScope` in the status, `scope` on runners, the `scope.violation` event, the `confirmationRequired` error, one-job runners (no admission token). Added in 1.1 without a version change (fields a client may ignore): `effectiveMaxConcurrentTasks` and `cappedByServer` in the status, the `leaseLost` and `released` outcomes, the places reserved for `full` access and the request delays. Added by R6 (KCA-749): the `confirming` connection and `confirmAssociation` (M1), the `awaitingConfirmation` and `pausedOnNestor` block reasons, and `claude` in the status (A7); a client of 1.1 shows an unknown connection as not associated and an unknown block reason as starting.
 
 ## Transport and access
 
@@ -50,9 +50,10 @@ Each connection is classified once, from the kernel, when it is accepted:
 | `machineInfo` | — | `MachineInfo` |
 | `machineStatus` | — | `MachineStatus` |
 | `connection` | — | `Connection` |
-| `associate` | — | `Connection`, `associating` (device authorization started; the machine key was generated first). Demo service: the simulated Nestor approves at its first poll. Live service: `unavailable` until the Nestor API work exists (S1). |
-| `cancelAssociation` | — | `Connection`. Abandons an association in progress; its key is erased. |
-| `disassociate` | `confirmed: true` | `Connection`. **Ends running tasks**: runners are terminated, the credential and the key erased even if Nestor cannot be reached; the revocation is retried. |
+| `associate` | — | `Connection`, `associating` (device authorization started; the machine key was generated first). Once approved on Nestor: `confirming`. Demo service: the simulated Nestor approves at its first poll. Live service: `unavailable` until the service has an HTTP transport to Nestor. |
+| `cancelAssociation` | — | `Connection`. Abandons an association in progress (Nestor is told when it can be); its key is erased. |
+| `confirmAssociation` | `accept`, `confirmed: true` | `Connection`. The owner's answer to the account of `confirming` (M1): `accept: true` → `associated`, runners may be created; `false` → the machine disassociates itself, as `disassociate`. |
+| `disassociate` | `confirmed: true` | `Connection`. **Ends running tasks**: runners are terminated, the credential and the key erased even if Nestor cannot be reached. Nestor is told first (`POST /machine/disassociate`); when it cannot be, a `service.error` event says to revoke the machine on the Nestor web app (no revocation can be signed for later: a proof is good 60 s). |
 | `setMode` | `mode`: `automatic` \| `paused`, `expectedRevision`? | `MachineStatus` |
 | `setMaxConcurrentTasks` | `value` (1 … `maxConcurrentTasksUpperBound`), `expectedRevision`?, `confirmed` (required to raise it) | `MachineStatus` |
 | `activeTasks` | — | `[ActiveTask]` |
@@ -78,9 +79,9 @@ Operations need the access level of the table above: `hello`, `machineInfo`, `ma
   "serviceMode": "live",                 // "live" | "demo" — the client shows its demo banner unless "live"
   "connection": {"state": "associated", "instance": "nestor.example", "sinceMs": 1793290000000},
   "mode": "automatic",                   // "automatic" | "paused"
-  "admission": {"state": "open"},        // or {"state":"paused"} or {"state":"blocked","reason":"notAssociated"|"unreachable"|"revoked"|"reconciling"}
+  "admission": {"state": "open"},        // or {"state":"paused"} or {"state":"blocked","reason":"notAssociated"|"unreachable"|"revoked"|"reconciling"|"awaitingConfirmation"|"pausedOnNestor"}
   "maxConcurrentTasks": 1,               // default 1: what the user asked for
-  "effectiveMaxConcurrentTasks": 1,      // what applies: 1 until Nestor announces its scope filter (S6)
+  "effectiveMaxConcurrentTasks": 1,      // what applies: 1 until Nestor announces its scope filter (S6), then within the administrator's limit (leases.administrator_max)
   "cappedByServer": false,               // true when the requested value is above it: "limited by the server"
   "maxConcurrentTasksUpperBound": 18,    // number of cores: rejects absurd input, limits no resource
   "configRevision": 3,
@@ -90,12 +91,14 @@ Operations need the access level of the table above: `hello`, `machineInfo`, `ma
   "activeTasks": [{"runnerId": "9f…", "runnerName": "runner-1", "taskRef": "…", "startedAtMs": 1793291000000}],
   "load": {"sampledAtMs": 1793291543411, "measuredCpuPercent": 7.8, "measuredMemoryUsedBytes": 19926319104,
            "measuredMemoryTotalBytes": 38654705664, "measuredMemoryPressure": "normal", "measuredDiskFreeBytes": 231194337280},
-  "configError": null                    // set when the stored settings were unreadable (the service then runs paused with 1 task), or when they could not be saved
+  "configError": null,                   // set when the stored settings were unreadable (the service then runs paused with 1 task), or when they could not be saved
+  "claude": "unknown"                    // "unknown" | "notSignedIn" (a job failed claude_not_signed_in) | "signedIn" (a job succeeded since)
 }
 
 // Connection
 {"state": "notAssociated"}
 | {"state": "associating", "instance": "…", "userCode": "WDJB-MJHT", "verificationUri": "https://…/machines/approve", "expiresAtMs": 0}
+| {"state": "confirming", "instance": "…", "accountEmail": "o***r@example.com", "approvedByEmail": "a***n@example.com"}   // masked by Nestor
 | {"state": "associated", "instance": "…", "sinceMs": 0}
 | {"state": "unreachable", "instance": "…", "reason": "…"} | {"state": "revoked"}
 
@@ -180,4 +183,4 @@ The demo and live services keep their state in separate directories, so demo dat
 
 ## Persistence
 
-`state.json` in the data directory (`0600`, written to a temporary file, synced, then renamed), schema 2: association, machine id, mode, ceiling, revision, the runners (id, name, generation, pid, process start time, scope) and a pending revocation (signed, no secret). **No secret** — the machine credential and key are in the Keychain and the Secure Enclave; runner credentials are never stored. The file is validated when read, schema and bounds; an unreadable file or **any invalid value** starts the service paused with one task at a time, reports `configError`, keeps the bad file as `state.json.corrupt-<pid>` and writes a safe one. Schema 1 files are read.
+`state.json` in the data directory (`0600`, written to a temporary file, synced, then renamed), schema 2: association, machine id, mode, ceiling, revision, the runners (id, name, generation, pid, process start time, scope) and, from earlier releases, a pending revocation, dropped at start with a `service.error` asking to revoke on Nestor. **No secret** — the machine credential and key are in the Keychain and the Secure Enclave; runner credentials are never stored. The file is validated when read, schema and bounds; an unreadable file or **any invalid value** starts the service paused with one task at a time, reports `configError`, keeps the bad file as `state.json.corrupt-<pid>` and writes a safe one. Schema 1 files are read.
