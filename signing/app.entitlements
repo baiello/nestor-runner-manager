@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Nestor Runner Manager (app and command line tool). Signed with the hardened runtime
+  (codesign --options runtime). Never add com.apple.security.get-task-allow or
+  com.apple.security.cs.* exceptions: the local service refuses a client that has them,
+  since another process of the same user could then inject code into it (A4).
+  TEAMID is replaced by scripts/sign-macos.sh.
+-->
+<plist version="1.0">
+<dict>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>TEAMID.fr.kocoa.nestor.runner-manager</string>
+	</array>
+</dict>
+</plist>

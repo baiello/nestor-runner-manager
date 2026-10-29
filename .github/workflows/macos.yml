@@ -36,6 +36,10 @@ jobs:
         run: |
           swift build -c release --arch arm64
           lipo -archs "$(swift build -c release --arch arm64 --show-bin-path)/NestorRunnerManager"
+      - name: Signing configuration (ad hoc; hardened runtime, no get-task-allow)
+        run: |
+          ../../scripts/sign-macos.sh --identity - --kind app --identifier fr.kocoa.nestor.runner-manager \
+            "$(swift build -c release --arch arm64 --show-bin-path)/NestorRunnerManager"
 
   core:
     runs-on: macos-latest
@@ -53,3 +57,8 @@ jobs:
         run: cargo test
       - name: Lint
         run: cargo clippy --all-targets -- -D warnings
+      - name: Signing configuration (ad hoc; hardened runtime, no get-task-allow)
+        run: |
+          cargo build --release --bin nestor-runner-service
+          ../scripts/sign-macos.sh --identity - --kind service --identifier fr.kocoa.nestor.runner-service \
+            target/release/nestor-runner-service

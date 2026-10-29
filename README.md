@@ -17,7 +17,7 @@ A desktop application and a local service to put a machine at Nestor's disposal.
 
 A runner takes **one task at a time**; that task may use several threads and processes. There is **no processor or memory limit** per runner: the number of tasks at a time regulates admissions, and the figures shown are measurements.
 
-Workspaces are not assigned here: on the Nestor web app, a workspace is assigned to runners or pools. The interface never asks for a password or a token; in the real version the association is confirmed in the browser and Nestor issues each runner its own credential.
+Workspaces are not assigned here: on the Nestor web app, workspaces are assigned to the machine. The interface never asks for a password or a token: an administrator approves the machine on Nestor with a code the interface shows, and Nestor issues a short-lived credential for each runner launch. Security design and evidence: [docs/security.md](docs/security.md).
 
 | Paused | Diagnostics | Busy runner | Failed runner |
 | --- | --- | --- | --- |
@@ -62,14 +62,14 @@ swift build -c release --arch arm64           # Apple Silicon release build
 lipo -archs "$(swift build -c release --arch arm64 --show-bin-path)/NestorRunnerManager"   # → arm64
 ```
 
-Demo scenarios (`--demo-scenario`): `populated` (default), `empty`, `notAssociated`, `unavailable`.
+Demo scenarios (`--demo-scenario`): `populated` (default), `empty`, `notAssociated`, `associating`, `unavailable`. They apply to the in-app demo only: the app refuses `--demo-scenario` together with `--service` or `--socket`.
 
 With the local service (see [core/README.md](core/README.md)):
 
 ```sh
 (cd ../../core && cargo run --bin nestor-runner-service)            # live, in another terminal
-swift run NestorRunnerManager --service
-(cd ../../core && cargo run --bin nestor-runner-service -- --simulate)
+swift run NestorRunnerManager --service                             # an unsigned build gets read-only access
+(cd ../../core && cargo run --bin nestor-runner-service -- --simulate --allow-unsigned-clients)
 swift run NestorRunnerManager --socket "$HOME/Library/Application Support/Nestor Runner Manager/demo/run/service.sock"
 ```
 
@@ -90,13 +90,13 @@ swift test -Xswiftc -load-plugin-library -Xswiftc /Library/Developer/CommandLine
 
 ## Continuous integration
 
-`.github/workflows/macos.yml` builds, tests and makes an arm64 release build of the app, and tests and lints `core/`, on GitHub's macOS runner for each pull request and each push to `main`. GitHub-hosted runners are free for public repositories.
+`.github/workflows/macos.yml` builds, tests and makes an arm64 release build of the app, and tests and lints `core/`, on GitHub's macOS runner for each pull request and each push to `main`. Both jobs also sign their binary ad hoc with `scripts/sign-macos.sh` to check the signing configuration (hardened runtime, no `get-task-allow`). GitHub-hosted runners are free for public repositories.
 
 ## Next steps
 
-1. Nestor API work (KCA-719): association by device authorization, one credential per runner, telemetry, and admission against the runner's existing claim protocol. Then the real runner behind the service's launcher, on a test Nestor first.
-2. Credentials in the Keychain; security review of the association and of the local API (KCA-720).
-3. Start at login (LaunchAgent), signing, installation on the Mac Studio — each to be authorized first.
+1. Nestor API work (contract v2, S1 to S7): device authorization, machine credential and runner credentials, eligible count per scope, lease ceiling, pause and scope enforced at claim (S6), the runner's one-job mode (S7). Then an HTTP client behind `NestorApi` and the real runner behind `ProcessLauncher`, on a test Nestor first. Security review before any real integration.
+2. Signing with an Apple Developer certificate (A6, to be validated by Brice): it is required for the Secure Enclave key, the Keychain and the verification of the app by the service.
+3. Start at login (LaunchAgent, acceptable only with dedicated runner accounts B1(a) or an explicit acceptance, see docs/security.md), installation on the Mac Studio — each to be authorized first.
 4. Admission driven by memory pressure and CPU, after real measurements on the Mac Studio.
 5. Windows and Linux clients on the same core.
 
