@@ -92,6 +92,8 @@ swift test -Xswiftc -load-plugin-library -Xswiftc /Library/Developer/CommandLine
 
 `.github/workflows/macos.yml` builds, tests and makes an arm64 release build of the app, and tests and lints `core/`, on GitHub's macOS runner for each pull request and each push to `main`. Both jobs also sign their binary ad hoc with `scripts/sign-macos.sh` to check the signing configuration (hardened runtime, no `get-task-allow`). GitHub-hosted runners are free for public repositories.
 
+The contract test with the real `nestor-runner run-once` (`core/tests/contract_run_once.rs`) does not run here: nestor is private, and this public repository holds no secret to read it. nestor's CI runs it instead, on each pull request of nestor that touches `apps/runner/**`, `docs/run-once-contract.md` or `contract/**`: it builds the runner of that pull request, clones this repository without a token at the commit nestor pins in `contract/runner-manager.rev`, and runs the test with `NESTOR_RUNNER_UNPINNED=1`. A change of the contract therefore lands here first (fixtures and `contract/nestor.rev`, test passed locally), then nestor pins that commit. See [contract/README.md](contract/README.md).
+
 ## Next steps
 
 1. Nestor API work (contract v2, S1 to S7): device authorization, machine credential and runner credentials, eligible count per scope, lease ceiling, pause and scope enforced at claim (S6), the runner's one-job mode (S7). Then an HTTP client behind `NestorApi` and the real runner behind `ProcessLauncher`, on a test Nestor first. Security review before any real integration.

@@ -13,9 +13,9 @@
 # - NESTOR_SOURCE=<checkout>: a local clone, which must be at the pinned commit, with apps/runner
 #   and contract unchanged;
 # - otherwise a fetch of the pinned commit only from NESTOR_REPOSITORY (default
-#   https://github.com/baiello/nestor.git, a private repository). With NESTOR_READ_TOKEN set (a
-#   read-only token, the CI secret), it authenticates with it; otherwise with git's own
-#   credentials. The token goes through an environment variable to git, never an argument.
+#   https://github.com/baiello/nestor.git, a private repository), with git's own credentials:
+#   those of a developer who can read nestor. No CI of this repository runs it: nestor's CI runs
+#   the contract test instead (core/README.md).
 #
 # An output directory whose `rev` already names the pinned commit is reused as it is (the CI
 # caches it by commit).
@@ -48,18 +48,10 @@ else
   rm -rf "$source"
   git init -q "$source"
   repository="${NESTOR_REPOSITORY:-https://github.com/baiello/nestor.git}"
-  if [ -n "${NESTOR_READ_TOKEN:-}" ]; then
-    # Basic authentication of GitHub with the token as password; given to git through its
-    # environment (GIT_CONFIG_*), so it is never in an argument nor in .git/config.
-    basic="$(printf 'x-access-token:%s' "$NESTOR_READ_TOKEN" | base64 | tr -d '\n')"
-    GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader GIT_CONFIG_VALUE_0="Authorization: Basic $basic" \
-      git -C "$source" fetch -q --depth 1 "$repository" "$rev"
-  else
-    git -C "$source" fetch -q --depth 1 "$repository" "$rev" || {
-      echo "cannot fetch nestor $rev from $repository: it is private; set NESTOR_READ_TOKEN (read-only) or NESTOR_SOURCE" >&2
-      exit 1
-    }
-  fi
+  git -C "$source" fetch -q --depth 1 "$repository" "$rev" || {
+    echo "cannot fetch nestor $rev from $repository: it is private; use git credentials that can read it, or NESTOR_SOURCE" >&2
+    exit 1
+  }
   git -C "$source" checkout -q --detach FETCH_HEAD
 fi
 
