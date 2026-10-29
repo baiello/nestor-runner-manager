@@ -83,29 +83,18 @@ struct RunnerDetailView: View {
     }
 
     private var resourcesCard: some View {
-        Card(title: "Resources", systemImage: "gauge.with.dots.needle.33percent") {
-            Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 8) {
-                GridRow {
-                    Text("").gridColumnAlignment(.leading)
-                    Text("In use").foregroundStyle(.secondary)
-                    Text(model.isDemo ? "Limit (not enforced)" : "Limit").foregroundStyle(.secondary)
-                }
-                Divider()
-                GridRow {
-                    Text("Processor")
-                    Text(Format.percent(runner.usage.cpuPercent))
-                    Text(runner.limits.cpuCores.map { "\($0) cores" } ?? "No limit")
-                }
-                GridRow {
-                    Text("Memory")
-                    Text(Format.bytes(runner.usage.memoryBytes))
-                    Text(runner.limits.memoryBytes.map(Format.bytes) ?? "No limit")
-                }
-            }
+        Card(title: "Resource usage", systemImage: "gauge.with.dots.needle.33percent") {
+            InfoRow(label: "Processor", value: Format.percent(runner.usage.cpuPercent))
+            InfoRow(label: "Memory", value: Format.bytes(runner.usage.memoryBytes))
+            Text(model.isDemo
+                 ? "Simulated measurements. A runner has no processor or memory limit."
+                 : "Measured now. A runner has no processor or memory limit.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
             Divider()
             InfoRow(label: "Job", value: runner.usage.isRunningJob ? "Running a job" : "Idle")
             InfoRow(label: "Capacity", value: "One job at a time")
-            Text("To run jobs in parallel, add more runners. Their isolation from each other is not guaranteed.")
+            Text("The job may use several threads and processes. To run jobs in parallel, add more runners. Their isolation from each other is not guaranteed.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
             if let lastJob = runner.lastJobAt {

@@ -71,17 +71,11 @@ private actor GatedRunnerService: RunnerService {
         #expect(model.runners.value?.count == 3)
     }
 
-    @Test func buildsTheRequestFromTheChosenLimits() {
+    @Test func buildsTheRequestFromTheNameAndStartChoice() {
         let form = AddRunnerForm()
         form.name = "ci"
-        form.limitsMemory = true
-        form.memoryGiB = 32
         form.startNow = false
-        #expect(form.request == NewRunnerRequest(
-            name: "ci",
-            limits: ResourceLimits(cpuCores: nil, memoryBytes: 32 << 30),
-            startNow: false
-        ))
+        #expect(form.request == NewRunnerRequest(name: "ci", startNow: false))
     }
 
     @Test func invalidNameBlocksSubmission() {

@@ -54,21 +54,11 @@ public enum RunnerState: String, Equatable, Sendable, CaseIterable {
     public var canRemove: Bool { self == .stopped || self == .failed }
 }
 
-/// Resource limits a runner is configured with. `nil` means no limit.
+/// What a runner is using right now, as measured. These are measurements, not caps: a runner has
+/// no processor or memory limit.
 ///
-/// There is no setting for the number of jobs: the Nestor runner takes no new job while one is
-/// running. To run jobs in parallel, a machine runs several runners. A job may use several cores.
-public struct ResourceLimits: Equatable, Sendable {
-    public var cpuCores: Int?
-    public var memoryBytes: UInt64?
-
-    public init(cpuCores: Int? = nil, memoryBytes: UInt64? = nil) {
-        self.cpuCores = cpuCores
-        self.memoryBytes = memoryBytes
-    }
-}
-
-/// What a runner is using right now.
+/// A runner takes one job at a time, as the Nestor runner does, and that job may use several
+/// threads and processes. To run jobs in parallel, a machine runs several runners.
 public struct ResourceUsage: Equatable, Sendable {
     public var cpuPercent: Double
     public var memoryBytes: UInt64
@@ -90,7 +80,6 @@ public struct Runner: Identifiable, Equatable, Sendable {
     public var state: RunnerState
     /// The last failure, shown while `state == .failed`.
     public var failureReason: String?
-    public var limits: ResourceLimits
     public var usage: ResourceUsage
     public var createdAt: Date
     public var lastJobAt: Date?
@@ -100,7 +89,6 @@ public struct Runner: Identifiable, Equatable, Sendable {
         name: String,
         state: RunnerState,
         failureReason: String? = nil,
-        limits: ResourceLimits = ResourceLimits(),
         usage: ResourceUsage = .idle,
         createdAt: Date,
         lastJobAt: Date? = nil
@@ -109,7 +97,6 @@ public struct Runner: Identifiable, Equatable, Sendable {
         self.name = name
         self.state = state
         self.failureReason = failureReason
-        self.limits = limits
         self.usage = usage
         self.createdAt = createdAt
         self.lastJobAt = lastJobAt
@@ -120,12 +107,10 @@ public struct Runner: Identifiable, Equatable, Sendable {
 /// by Nestor and stored by the service, never typed into the interface.
 public struct NewRunnerRequest: Equatable, Sendable {
     public var name: String
-    public var limits: ResourceLimits
     public var startNow: Bool
 
-    public init(name: String, limits: ResourceLimits = ResourceLimits(), startNow: Bool = true) {
+    public init(name: String, startNow: Bool = true) {
         self.name = name
-        self.limits = limits
         self.startNow = startNow
     }
 }

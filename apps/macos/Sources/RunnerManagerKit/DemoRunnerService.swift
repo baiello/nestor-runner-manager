@@ -95,7 +95,6 @@ public actor DemoRunnerService: RunnerService {
         let runner = Runner(
             name: name,
             state: request.startNow ? .running : .stopped,
-            limits: request.limits,
             createdAt: created
         )
         runnerList.append(runner)
@@ -171,7 +170,6 @@ public actor DemoRunnerService: RunnerService {
         let build = Runner(
             name: "studio-build",
             state: .running,
-            limits: ResourceLimits(cpuCores: 12, memoryBytes: 64 * gib),
             usage: ResourceUsage(cpuPercent: 37.5, memoryBytes: 18 * gib, isRunningJob: true),
             createdAt: ago(86_400 * 3),
             lastJobAt: ago(120)
@@ -179,7 +177,6 @@ public actor DemoRunnerService: RunnerService {
         let agents = Runner(
             name: "studio-agents",
             state: .stopped,
-            limits: ResourceLimits(cpuCores: 8, memoryBytes: 32 * gib),
             createdAt: ago(86_400 * 2),
             lastJobAt: ago(7_200)
         )
@@ -187,7 +184,6 @@ public actor DemoRunnerService: RunnerService {
             name: "studio-gpu",
             state: .failed,
             failureReason: "Simulated failure: the runner exited with status 1.",
-            limits: ResourceLimits(memoryBytes: 48 * gib),
             createdAt: ago(86_400),
             lastJobAt: ago(5_400)
         )
@@ -204,7 +200,7 @@ public actor DemoRunnerService: RunnerService {
             ]),
             (gpu, [
                 LogEntry(date: ago(86_400), level: .info, message: "[demo] Runner created (simulated)."),
-                LogEntry(date: ago(5_500), level: .warning, message: "[demo] Memory close to its limit (simulated)."),
+                LogEntry(date: ago(5_500), level: .warning, message: "[demo] Job took longer than usual (simulated)."),
                 LogEntry(date: ago(5_400), level: .error, message: "[demo] Runner exited with status 1 (simulated)."),
             ]),
         ]

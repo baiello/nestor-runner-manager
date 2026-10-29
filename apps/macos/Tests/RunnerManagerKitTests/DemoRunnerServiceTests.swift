@@ -35,12 +35,11 @@ import Testing
         #expect(runner.state == .running)
     }
 
-    @Test func addedRunnerKeepsItsLimitsAndCanStayStopped() async throws {
+    @Test func addedRunnerCanStayStopped() async throws {
         let demo = service(.empty)
-        let limits = ResourceLimits(cpuCores: 2, memoryBytes: 8 << 30)
-        let runner = try await demo.addRunner(NewRunnerRequest(name: "  ci  ", limits: limits, startNow: false))
+        let runner = try await demo.addRunner(NewRunnerRequest(name: "  ci  ", startNow: false))
         #expect(runner.name == "ci")
-        #expect(runner.limits == limits)
+        #expect(runner.usage == .idle)
         #expect(runner.state == .stopped)
         #expect(try await demo.runners().map(\.id) == [runner.id])
         let logs = try await demo.logs(runnerID: runner.id, limit: 10)

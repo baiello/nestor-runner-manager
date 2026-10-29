@@ -10,10 +10,6 @@ import Observation
 @Observable
 public final class AddRunnerForm {
     public var name = ""
-    public var limitsCPU = false
-    public var cpuCores = 4
-    public var limitsMemory = false
-    public var memoryGiB = 16
     public var startNow = true
 
     public private(set) var isSubmitting = false
@@ -43,14 +39,7 @@ public final class AddRunnerForm {
     }
 
     public var request: NewRunnerRequest {
-        NewRunnerRequest(
-            name: name,
-            limits: ResourceLimits(
-                cpuCores: limitsCPU ? cpuCores : nil,
-                memoryBytes: limitsMemory ? UInt64(memoryGiB) << 30 : nil
-            ),
-            startNow: startNow
-        )
+        NewRunnerRequest(name: name, startNow: startNow)
     }
 
     /// Sends the request once; returns the created runner, or nil if it failed or was already sending.

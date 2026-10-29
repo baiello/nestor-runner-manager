@@ -20,7 +20,7 @@ enum Snapshots {
             ("01-overview", AnyView(ContentView(model: populated)), size),
             ("02-runner-running", AnyView(ContentView(model: populated, selection: byName["studio-build"].map(SidebarItem.runner))), size),
             ("03-runner-failed", AnyView(ContentView(model: populated, selection: byName["studio-gpu"].map(SidebarItem.runner))), size),
-            ("04-add-runner", AnyView(AddRunnerSheet(model: populated, form: sampleForm(), onAdded: { _ in })), NSSize(width: 460, height: 560)),
+            ("04-add-runner", AnyView(AddRunnerSheet(model: populated, form: sampleForm(), onAdded: { _ in })), NSSize(width: 460, height: 340)),
             ("05-not-associated", AnyView(ContentView(model: loadedModel(.notAssociated))), size),
             ("06-no-runner", AnyView(ContentView(model: loadedModel(.empty))), size),
             ("07-service-unavailable", AnyView(ContentView(model: loadedModel(.unavailable))), size),
@@ -40,8 +40,6 @@ enum Snapshots {
     private static func sampleForm() -> AddRunnerForm {
         let form = AddRunnerForm()
         form.name = "studio-ci"
-        form.limitsMemory = true
-        form.memoryGiB = 32
         return form
     }
 
