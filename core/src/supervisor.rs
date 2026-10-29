@@ -1,38 +1,47 @@
 //! The supervisor: the single local authority over this machine's runners.
 //!
-//! It keeps the runners' state machines, sizes the pool to the admission ceiling and the work
-//! available, admits tasks through the [`Regulator`], persists its configuration and records
-//! events. Every operation runs under one lock, so two concurrent calls can never launch the same
-//! runner twice or admit past the ceiling. Starting a process and admitting a task are separate:
-//! a runner that is up still needs a token before it may claim a task from Nestor.
+//! Managed runners are "one job" processes (contract v2 §3.4): launched, they claim at most one
+//! job from Nestor, run it and exit. **Launching a runner is the admission**: the supervisor
+//! launches one only when the [`Regulator`] allows it (automatic mode, not blocked, fewer live
+//! runners than the ceiling, eligible jobs in the active scope). Every operation runs under one
+//! lock, so two concurrent calls can never launch the same runner twice or go past the ceiling.
 //!
-//! Pausing and lowering the ceiling never stop a busy runner. Idle runners above the target are
-//! stopped after `idle_timeout_ms`.
+//! Pausing, lowering the ceiling, losing the connection and idle timeouts **drain** runners that
+//! have no job yet: they stop claiming and exit; a runner that holds a job finishes it. Nothing
+//! is interrupted (principle 8). Only revocation, disassociation and a forced stop from the
+//! diagnostics **terminate** runners (graceful signal, then kill after a grace period), because
+//! the runner's `SIGTERM` abandons its job.
+//!
+//! None of this is a security boundary (principle 7): the server enforces leases, ceiling, pause
+//! and scope at claim time.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::admission::{Denied, Regulator, Token};
+use crate::admission::{Denied, LiveScope, Regulator};
+use crate::mask::Redactor;
 use crate::model::*;
-use crate::persist::{Loaded, RunnerRecord, Store, StoredState};
+use crate::persist::{Loaded, RunnerRecord, Store, StoredState, MAX_RUNNERS};
+use crate::sys::ProcessIdentity;
 
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
-/// Starts and stops runner processes. The fake launcher of the tests and the demo implements it
-/// without processes; the real one will wrap the existing Nestor runner.
+/// Starts and stops runner processes. [`crate::process::ProcessLauncher`] runs real ones;
+/// [`crate::fake::FakeLauncher`] pretends, for the tests and the demo.
 pub trait Launcher: Send + Sync {
-    /// Obtains an identity for a new runner (in the real version, a credential issued by Nestor
-    /// for this runner only).
-    fn provision(&self, runner: &RunnerRecord) -> Result<(), ServiceError>;
-    /// Launches the process of `runner.generation` and returns its pid.
-    fn spawn(&self, runner: &RunnerRecord) -> Result<u32, String>;
-    /// Asks the process to finish gracefully. The supervisor learns that it ended through
-    /// [`Supervisor::runner_exited`].
-    fn terminate(&self, runner_id: &str, generation: u64, pid: u32);
-    /// Whether `pid` is still the process of this runner and generation.
-    fn is_alive(&self, runner_id: &str, generation: u64, pid: u32) -> bool;
-    /// Forgets the runner's identity (revocation in Nestor in the real version).
-    fn deprovision(&self, runner_id: &str);
+    /// Launches the one-job process of `runner.generation`, restricted to `runner.scope` when
+    /// set. The runner gets its credential from the launcher, never from the supervisor.
+    fn spawn(&self, runner: &RunnerRecord) -> Result<ProcessIdentity, String>;
+    /// Asks the process to stop claiming and exit once its job, if any, is done. Never
+    /// interrupts a job.
+    fn drain(&self, runner: &RunnerRecord);
+    /// Ends the process now: a graceful signal, or a kill with `force`. Ends its job too; only
+    /// for revocation, disassociation and forced stops. Must check the process identity first.
+    fn terminate(&self, runner: &RunnerRecord, force: bool);
+    /// Whether the recorded process (pid, start time and generation) is still alive.
+    fn is_alive(&self, runner: &RunnerRecord) -> bool;
+    /// Erases what the runner left locally (its state and work directories).
+    fn forget(&self, runner_id: &str);
 }
 
 #[derive(Debug, Clone)]
@@ -40,11 +49,15 @@ pub struct Options {
     pub service_mode: ServiceMode,
     /// Highest ceiling accepted; a sanity check on the input (the number of cores by default).
     pub ceiling_upper_bound: u32,
+    /// A runner waiting for a job longer than this, with nothing eligible in its scope, is
+    /// drained. The one-job runner also exits by itself after its own idle delay.
     pub idle_timeout_ms: u64,
     /// Crashes in a row before a runner is left `failed`.
     pub max_crashes: u32,
     pub backoff_base_ms: u64,
     pub backoff_max_ms: u64,
+    /// After a graceful termination, how long before the process is killed.
+    pub kill_grace_ms: u64,
     pub log_capacity: usize,
     pub event_capacity: usize,
 }
@@ -58,6 +71,7 @@ impl Options {
             max_crashes: 5,
             backoff_base_ms: 1_000,
             backoff_max_ms: 300_000,
+            kill_grace_ms: 10_000,
             log_capacity: 200,
             event_capacity: 1_024,
         }
@@ -75,10 +89,20 @@ struct Slot {
     last_task_at_ms: Option<u64>,
     crashes: u32,
     restart_at_ms: Option<u64>,
-    /// Stopped by hand: the supervisor does not start it again until it is started by hand.
+    /// Stopped by hand: the supervisor does not launch it again until it is started by hand.
     held: bool,
-    /// Found running after a restart of the service: busy until it reports idle.
+    /// Found alive after a restart of the service: it did not launch it in this run.
     adopted: bool,
+    /// Asked to drain: it will exit after its job, if any.
+    draining: bool,
+    /// Terminated on purpose (not drained): its task, if any, ends as `stopped`.
+    terminating: bool,
+    /// Killed if still alive at this time.
+    kill_at_ms: Option<u64>,
+    /// Reported a job outside its scope.
+    scope_violated: bool,
+    /// Removed once its process has exited (disassociation, revocation).
+    discard: bool,
     usage: (f64, u64),
     logs: VecDeque<LogEntry>,
 }
@@ -93,6 +117,7 @@ struct Inner {
     config_error: Option<String>,
     load: Option<LoadSample>,
     last_admission: Admission,
+    last_queue: Option<Queue>,
 }
 
 pub struct Supervisor {
@@ -101,41 +126,55 @@ pub struct Supervisor {
     store: Arc<dyn Store>,
     clock: Clock,
     options: Options,
+    redactor: Redactor,
 }
 
-/// Why `admit` refused, in the terms of the local API.
+/// Why a launch was refused, in the terms of the local API.
 impl From<Denied> for ServiceError {
     fn from(denied: Denied) -> Self {
         match denied {
-            Denied::Paused => ServiceError::Unavailable("Admissions are paused.".into()),
+            Denied::Paused => ServiceError::Unavailable("Tasks are paused.".into()),
             Denied::Blocked(BlockReason::NotAssociated) => ServiceError::NotAssociated,
             Denied::Blocked(BlockReason::Revoked) => ServiceError::Revoked,
             Denied::Blocked(BlockReason::Unreachable) => ServiceError::Unreachable,
             Denied::Blocked(BlockReason::Reconciling) => ServiceError::Unavailable("The service is starting.".into()),
-            Denied::AtCapacity { busy, ceiling } => {
-                ServiceError::Unavailable(format!("{busy} of {ceiling} tasks already running."))
+            Denied::AtCapacity { live, ceiling } => {
+                ServiceError::Unavailable(format!("{live} of {ceiling} runners already running."))
             }
-            Denied::AlreadyHolding => {
-                ServiceError::InvalidTransition { from: RunnerState::Busy, action: "admit".into() }
-            }
+            Denied::ScopeUnknown | Denied::ScopeViolation => ServiceError::Unavailable(
+                "A running task's workspace is not known; no other task starts until it ends.".into(),
+            ),
         }
     }
 }
 
 impl Supervisor {
-    /// Loads the stored state. Nothing is admitted until [`Supervisor::reconcile`] has adopted or
-    /// cleared the processes the previous service left behind.
-    pub fn open(store: Arc<dyn Store>, launcher: Arc<dyn Launcher>, clock: Clock, options: Options) -> Self {
+    /// Loads and validates the stored state. Nothing is launched until [`Supervisor::reconcile`]
+    /// has adopted or cleared the processes the previous service left behind.
+    pub fn open(
+        store: Arc<dyn Store>,
+        launcher: Arc<dyn Launcher>,
+        clock: Clock,
+        options: Options,
+        redactor: Redactor,
+    ) -> Self {
         let loaded = store.load();
-        let config_error = match &loaded {
-            Loaded::Corrupt { error, kept_at, .. } => Some(match kept_at {
-                Some(path) => format!("{error} (kept as {}); started paused with 1 task at a time", path.display()),
-                None => format!("{error}; started paused with 1 task at a time"),
-            }),
+        let mut config_error = match &loaded {
+            Loaded::Corrupt { error, kept_at, .. } => Some((error.clone(), kept_at.clone())),
             _ => None,
         };
         let mut stored = loaded.state().clone();
-        stored.max_concurrent_tasks = stored.max_concurrent_tasks.clamp(1, options.ceiling_upper_bound);
+        if config_error.is_none() {
+            if let Err(error) = stored.validate(options.ceiling_upper_bound) {
+                // Parsed but out of bounds: same safe fallback as an unreadable file (N1).
+                config_error = Some((error, store.set_aside()));
+                stored = StoredState::safe_fallback();
+            }
+        }
+        let config_error = config_error.map(|(error, kept_at)| match kept_at {
+            Some(path) => format!("{error} (kept as {}); started paused with 1 task at a time", path.display()),
+            None => format!("{error}; started paused with 1 task at a time"),
+        });
         let mut regulator = Regulator::new(stored.mode, stored.max_concurrent_tasks);
         regulator.set_blocked(Some(BlockReason::Reconciling));
         let slots = stored
@@ -154,15 +193,17 @@ impl Supervisor {
                 config_error: config_error.clone(),
                 load: None,
                 last_admission: Admission::Blocked(BlockReason::Reconciling),
+                last_queue: None,
             }),
             launcher,
             store,
             clock,
             options,
+            redactor,
         };
         if let Some(message) = config_error {
             let mut inner = supervisor.lock();
-            supervisor.emit(&mut inner, EventKind::ServiceError { message });
+            supervisor.emit_error(&mut inner, &message);
             // Write the safe configuration so the next start does not trip on the same file.
             supervisor.persist(&mut inner);
         }
@@ -171,6 +212,10 @@ impl Supervisor {
 
     pub fn options(&self) -> &Options {
         &self.options
+    }
+
+    pub fn redactor(&self) -> &Redactor {
+        &self.redactor
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -183,38 +228,42 @@ impl Supervisor {
 
     // MARK: Startup
 
-    /// Adopts the runner processes still alive from before a restart (they count as busy until
-    /// they report idle) and clears the others. Never launches a process over an existing one.
+    /// Adopts the runner processes still alive from before a restart and clears the others.
+    /// A pid is adopted only if the process behind it has the recorded start time and
+    /// generation; otherwise it is forgotten, never signalled. Never launches a process over an
+    /// existing one. An adopted runner lost its control pipe with the old service, so it is
+    /// already draining: it finishes its job, if any, and exits.
     pub fn reconcile(&self) {
         let mut inner = self.lock();
         let ids: Vec<RunnerId> = inner.slots.keys().cloned().collect();
         for id in ids {
-            let (generation, pid) = {
-                let slot = &inner.slots[&id];
-                (slot.record.generation, slot.record.pid)
-            };
-            match pid {
-                Some(pid) if self.launcher.is_alive(&id, generation, pid) => {
-                    inner.regulator.adopt(&id, generation);
-                    inner.slots.get_mut(&id).unwrap().adopted = true;
-                    self.set_state(&mut inner, &id, RunnerState::Busy);
-                    self.log(
-                        &mut inner,
-                        &id,
-                        LogLevel::Info,
-                        format!("Adopted the running process {pid} after a restart of the service."),
-                    );
+            let record = inner.slots[&id].record.clone();
+            let Some(pid) = record.pid else { continue };
+            if self.launcher.is_alive(&record) {
+                {
+                    let slot = inner.slots.get_mut(&id).unwrap();
+                    slot.adopted = true;
+                    slot.draining = true;
                 }
-                Some(pid) => {
-                    inner.slots.get_mut(&id).unwrap().record.pid = None;
-                    self.log(
-                        &mut inner,
-                        &id,
-                        LogLevel::Warning,
-                        format!("Process {pid} ended while the service was stopped."),
-                    );
-                }
-                None => {}
+                // Whether it holds a job is unknown: count it busy, which the ceiling does anyway.
+                self.set_state(&mut inner, &id, RunnerState::Busy);
+                self.log(
+                    &mut inner,
+                    &id,
+                    LogLevel::Info,
+                    format!("Adopted process {pid} after a restart of the service."),
+                );
+            } else {
+                let slot = inner.slots.get_mut(&id).unwrap();
+                slot.record.pid = None;
+                slot.record.start_time_us = None;
+                slot.record.scope = None;
+                self.log(
+                    &mut inner,
+                    &id,
+                    LogLevel::Warning,
+                    format!("Process {pid} ended while the service was stopped."),
+                );
             }
         }
         inner.reconciled = true;
@@ -222,178 +271,256 @@ impl Supervisor {
         self.refresh_admission(&mut inner);
     }
 
-    // MARK: Pool sizing
+    // MARK: Regulation
 
-    /// Sizes the pool: starts runners so that free admission slots can be used for the
-    /// `eligible_tasks` Nestor offers this machine, and stops runners idle for longer than
-    /// `idle_timeout_ms` beyond that target. Busy runners are never stopped here.
-    pub fn tick(&self, eligible_tasks: u32) {
+    /// Launches runners for the jobs `queue` offers, within the ceiling and the active scope;
+    /// drains the runners that are not needed; watches adopted processes and pending kills.
+    pub fn tick(&self, queue: &Queue) {
         let mut inner = self.lock();
         if !inner.reconciled {
             return;
         }
         let now = self.now();
-        let wanted_idle = inner.regulator.free_slots().min(eligible_tasks) as usize;
-        let idle_live =
-            inner.slots.values().filter(|s| matches!(s.state, RunnerState::Starting | RunnerState::Ready)).count();
+        inner.last_queue = Some(queue.clone());
 
-        if idle_live < wanted_idle {
-            for _ in idle_live..wanted_idle {
-                let candidate = inner
-                    .slots
-                    .values()
-                    .filter(|s| {
-                        s.state == RunnerState::Stopped && !s.held && s.restart_at_ms.is_none_or(|at| at <= now)
-                    })
-                    .map(|s| s.record.id.clone())
-                    .next();
-                let id = match candidate {
-                    Some(id) => id,
-                    // A new runner only while the service manages fewer than the ceiling, so a
-                    // runner waiting out its restart delay is not replaced by a fresh one.
-                    None if Self::provisioned(&inner) < inner.stored.max_concurrent_tasks => {
-                        match self.provision(&mut inner, None, false) {
-                            Ok(id) => id,
-                            Err(error) => {
-                                self.emit(&mut inner, EventKind::ServiceError { message: error.to_string() });
-                                break;
-                            }
-                        }
-                    }
-                    None => break,
-                };
-                self.spawn(&mut inner, &id);
-            }
-        } else if idle_live > wanted_idle {
-            let mut idle: Vec<(u64, RunnerId)> = inner
+        // Adopted processes are not our children: their exit is noticed by polling.
+        let gone: Vec<(RunnerId, u64)> = inner
+            .slots
+            .values()
+            .filter(|s| s.adopted && s.state.is_live() && !self.launcher.is_alive(&s.record))
+            .map(|s| (s.record.id.clone(), s.record.generation))
+            .collect();
+        for (id, generation) in gone {
+            self.exited(&mut inner, &id, generation, RunnerExit::Vanished);
+        }
+
+        // Terminated processes still alive after the grace period are killed.
+        let due: Vec<RunnerId> = inner
+            .slots
+            .values()
+            .filter(|s| s.state.is_live() && s.kill_at_ms.is_some_and(|at| at <= now))
+            .map(|s| s.record.id.clone())
+            .collect();
+        for id in due {
+            let record = {
+                let slot = inner.slots.get_mut(&id).unwrap();
+                slot.kill_at_ms = None;
+                slot.record.clone()
+            };
+            self.log(&mut inner, &id, LogLevel::Warning, "Still running after the grace period: killed.".into());
+            self.launcher.terminate(&record, true);
+        }
+
+        self.drain_surplus(&mut inner, Some(queue));
+
+        let live = Self::live_scopes(&inner);
+        let plan = match inner.regulator.plan(&live, queue) {
+            Ok(plan) => plan,
+            Err(_) => return,
+        };
+        for _ in 0..plan.count {
+            let candidate = inner
                 .slots
                 .values()
-                .filter(|s| s.state == RunnerState::Ready)
-                .filter_map(|s| s.idle_since_ms.map(|since| (since, s.record.id.clone())))
-                .filter(|(since, _)| now.saturating_sub(*since) >= self.options.idle_timeout_ms)
-                .collect();
-            idle.sort();
-            for (_, id) in idle.into_iter().take(idle_live - wanted_idle) {
-                self.log(&mut inner, &id, LogLevel::Info, "Stopping: idle and not needed.".into());
-                self.terminate(&mut inner, &id);
+                .filter(|s| {
+                    s.state == RunnerState::Stopped
+                        && !s.held
+                        && !s.discard
+                        && !s.record.manual
+                        && s.restart_at_ms.is_none_or(|at| at <= now)
+                })
+                .map(|s| s.record.id.clone())
+                .next();
+            let id = match candidate {
+                Some(id) => id,
+                // A new runner only while the service manages fewer than the ceiling, so a
+                // runner waiting out its restart delay is not replaced by a fresh one.
+                None if Self::automatic(&inner) < inner.stored.max_concurrent_tasks
+                    && inner.slots.len() < MAX_RUNNERS =>
+                {
+                    self.create(&mut inner, None, false)
+                }
+                None => break,
+            };
+            self.launch(&mut inner, &id, plan.scope.clone());
+        }
+    }
+
+    /// Drains the runners without a job that are not wanted any more: all of them while paused
+    /// or blocked, those above the ceiling, and those idle too long with nothing eligible in
+    /// their scope. Busy runners are never touched.
+    fn drain_surplus(&self, inner: &mut Inner, queue: Option<&Queue>) {
+        let now = self.now();
+        let open = inner.regulator.admission() == Admission::Open;
+        let mut idle: Vec<(u64, RunnerId)> = inner
+            .slots
+            .values()
+            .filter(|s| matches!(s.state, RunnerState::Starting | RunnerState::Ready) && !s.draining)
+            .map(|s| (s.idle_since_ms.unwrap_or(now), s.record.id.clone()))
+            .collect();
+        // Newest first: the oldest idle runners are the likeliest to claim soon.
+        idle.sort_by(|a, b| b.cmp(a));
+        let live = inner.slots.values().filter(|s| s.state.is_live() && !s.draining).count() as u32;
+        let excess = live.saturating_sub(inner.regulator.ceiling()) as usize;
+        let mut to_drain: Vec<(RunnerId, &'static str)> = Vec::new();
+        if !open {
+            to_drain.extend(idle.iter().map(|(_, id)| (id.clone(), "paused or not connected")));
+        } else {
+            to_drain.extend(idle.iter().take(excess).map(|(_, id)| (id.clone(), "above the tasks-at-a-time setting")));
+            for (since, id) in idle.iter().skip(excess) {
+                let nothing_eligible = queue.is_some_and(|q| match &inner.slots[id].record.scope {
+                    Some(scope) => q.in_scope(scope) == 0,
+                    None => q.total() == 0,
+                });
+                if nothing_eligible && now.saturating_sub(*since) >= self.options.idle_timeout_ms {
+                    to_drain.push((id.clone(), "idle and not needed"));
+                }
             }
+        }
+        for (id, why) in to_drain {
+            self.log(inner, &id, LogLevel::Info, format!("Draining: {why}. It will not claim a task."));
+            self.drain(inner, &id);
         }
     }
 
     // MARK: Runner reports
 
-    /// The runner is up and registered (or, after an adoption, reports that it is idle).
+    /// The runner is up and waiting for a job.
     pub fn runner_ready(&self, runner_id: &str, generation: u64) -> Result<(), ServiceError> {
         let mut inner = self.lock();
         let slot = Self::current(&inner, runner_id, generation)?;
-        match slot.state {
-            RunnerState::Starting => {}
-            RunnerState::Busy if slot.adopted => {
-                inner.regulator.release_runner(runner_id);
-            }
-            from => return Err(ServiceError::InvalidTransition { from, action: "mark ready".into() }),
+        if slot.state != RunnerState::Starting {
+            return Err(ServiceError::InvalidTransition { from: slot.state, action: "mark ready".into() });
         }
         let now = self.now();
-        let slot = inner.slots.get_mut(runner_id).unwrap();
-        slot.crashes = 0;
-        slot.adopted = false;
-        slot.idle_since_ms = Some(now);
+        inner.slots.get_mut(runner_id).unwrap().idle_since_ms = Some(now);
         self.set_state(&mut inner, runner_id, RunnerState::Ready);
-        self.refresh_admission(&mut inner);
         Ok(())
     }
 
-    /// Asks for a token before claiming a task from Nestor. Refused while paused, blocked, at
-    /// the ceiling, or if the runner is not ready.
-    pub fn admit(&self, runner_id: &str, generation: u64) -> Result<Token, ServiceError> {
+    /// The runner claimed its one job. A second claim is refused and logged: a one-job runner
+    /// never claims twice. A job outside the runner's scope is a violation (B1(b)): it is
+    /// reported and nothing more is launched until that runner ends.
+    pub fn runner_claimed(
+        &self,
+        runner_id: &str,
+        generation: u64,
+        task_ref: &str,
+        scope: Option<&str>,
+    ) -> Result<(), ServiceError> {
         let mut inner = self.lock();
         let slot = Self::current(&inner, runner_id, generation)?;
-        if slot.state != RunnerState::Ready {
-            return Err(ServiceError::InvalidTransition { from: slot.state, action: "admit a task on".into() });
+        if !matches!(slot.state, RunnerState::Starting | RunnerState::Ready) || slot.task_ref.is_some() {
+            let from = slot.state;
+            self.log(&mut inner, runner_id, LogLevel::Error, "Reported a second claim; a runner takes one job.".into());
+            return Err(ServiceError::InvalidTransition { from, action: "claim a second task on".into() });
         }
-        let token = inner.regulator.try_acquire(runner_id, generation)?;
-        self.set_state(&mut inner, runner_id, RunnerState::Busy);
-        Ok(token)
-    }
-
-    /// The runner got a task from Nestor with its token.
-    pub fn task_started(&self, token: &Token, task_ref: &str) -> Result<(), ServiceError> {
-        let mut inner = self.lock();
-        Self::holder(&inner, token)?;
+        let task_ref: String = task_ref.chars().filter(|c| c.is_ascii_graphic()).take(128).collect();
+        if let Some(scope) = scope {
+            validate_scope(scope)?;
+        }
         let now = self.now();
-        {
-            let slot = inner.slots.get_mut(&token.runner_id).unwrap();
-            slot.task_ref = Some(task_ref.to_string());
+        let violated = {
+            let slot = inner.slots.get_mut(runner_id).unwrap();
+            slot.task_ref = Some(task_ref.clone());
             slot.task_started_ms = Some(now);
             slot.last_task_at_ms = Some(now);
-        }
-        self.log(&mut inner, &token.runner_id, LogLevel::Info, format!("Task {task_ref} started."));
-        self.emit(&mut inner, EventKind::TaskStarted { runner_id: token.runner_id.clone(), task_ref: task_ref.into() });
-        Ok(())
-    }
-
-    /// The task ended (or no task was claimed): the token goes back and the runner is idle again.
-    pub fn task_finished(&self, token: &Token, outcome: TaskOutcome) -> Result<(), ServiceError> {
-        let mut inner = self.lock();
-        Self::holder(&inner, token)?;
-        inner.regulator.release(token);
-        let now = self.now();
-        let task_ref = {
-            let slot = inner.slots.get_mut(&token.runner_id).unwrap();
-            slot.task_started_ms = None;
-            slot.idle_since_ms = Some(now);
-            slot.task_ref.take()
+            slot.idle_since_ms = None;
+            match (&slot.record.scope, scope) {
+                (Some(pinned), Some(reported)) if pinned != reported => true,
+                (Some(_), None) => true,
+                (None, Some(reported)) => {
+                    slot.record.scope = Some(reported.to_string());
+                    false
+                }
+                _ => false,
+            }
         };
-        if let Some(task) = &task_ref {
-            let level = if outcome == TaskOutcome::Succeeded { LogLevel::Info } else { LogLevel::Warning };
-            self.log(&mut inner, &token.runner_id, level, format!("Task {task} finished: {}.", outcome_text(outcome)));
+        self.set_state(&mut inner, runner_id, RunnerState::Busy);
+        self.log(&mut inner, runner_id, LogLevel::Info, format!("Task {task_ref} started."));
+        self.emit(&mut inner, EventKind::TaskStarted { runner_id: runner_id.into(), task_ref });
+        if violated {
+            inner.slots.get_mut(runner_id).unwrap().scope_violated = true;
+            self.log(
+                &mut inner,
+                runner_id,
+                LogLevel::Error,
+                "Nestor gave this runner a task outside its workspace scope. No other task starts until it ends."
+                    .into(),
+            );
+            self.emit(&mut inner, EventKind::ScopeViolation { runner_id: runner_id.into() });
         }
-        self.emit(&mut inner, EventKind::TaskFinished { runner_id: token.runner_id.clone(), task_ref, outcome });
-        if inner.slots[&token.runner_id].state == RunnerState::Busy {
-            self.set_state(&mut inner, &token.runner_id, RunnerState::Ready);
-        }
+        self.persist(&mut inner);
         Ok(())
     }
 
-    /// The runner's process ended. A stale generation is ignored. An exit nobody asked for counts
-    /// as a crash: restart with backoff, then `failed` after `max_crashes` in a row.
-    pub fn runner_exited(&self, runner_id: &str, generation: u64, reason: &str) {
+    /// The runner's process ended. A stale generation is ignored.
+    pub fn runner_exited(&self, runner_id: &str, generation: u64, exit: RunnerExit) {
         let mut inner = self.lock();
-        if Self::current(&inner, runner_id, generation).is_err() {
+        self.exited(&mut inner, runner_id, generation, exit);
+    }
+
+    fn exited(&self, inner: &mut Inner, runner_id: &str, generation: u64, exit: RunnerExit) {
+        if Self::current(inner, runner_id, generation).is_err() {
             return;
         }
-        let (state, task_ref) = {
+        let (state, task_ref, terminated, discard) = {
             let slot = &inner.slots[runner_id];
-            (slot.state, slot.task_ref.clone())
+            (slot.state, slot.task_ref.clone(), slot.terminating || slot.discard, slot.discard)
         };
         if !state.is_live() {
             return;
         }
-        if state == RunnerState::Busy || inner.regulator.token_of(runner_id).is_some() {
-            inner.regulator.release_runner(runner_id);
-            self.emit(
-                &mut inner,
-                EventKind::TaskFinished { runner_id: runner_id.into(), task_ref, outcome: TaskOutcome::RunnerLost },
-            );
+        if task_ref.is_some() || state == RunnerState::Busy {
+            let outcome = match &exit {
+                _ if terminated => TaskOutcome::Stopped,
+                RunnerExit::Finished(outcome) => *outcome,
+                RunnerExit::Crashed(_) => TaskOutcome::RunnerLost,
+                RunnerExit::Idle | RunnerExit::Vanished => TaskOutcome::Unknown,
+            };
+            if let Some(task) = &task_ref {
+                let level = if outcome == TaskOutcome::Succeeded { LogLevel::Info } else { LogLevel::Warning };
+                self.log(inner, runner_id, level, format!("Task {task} ended: {}.", outcome_text(outcome)));
+            }
+            self.emit(inner, EventKind::TaskFinished { runner_id: runner_id.into(), task_ref, outcome });
         }
-        let expected = state == RunnerState::Stopping;
+        let was_draining = inner.slots[runner_id].draining;
         {
             let slot = inner.slots.get_mut(runner_id).unwrap();
             slot.record.pid = None;
+            slot.record.start_time_us = None;
+            slot.record.scope = None;
             slot.adopted = false;
+            slot.draining = false;
+            slot.terminating = false;
+            slot.kill_at_ms = None;
+            slot.scope_violated = false;
             slot.task_ref = None;
             slot.task_started_ms = None;
             slot.idle_since_ms = None;
             slot.usage = (0.0, 0);
         }
-        if expected {
-            self.log(&mut inner, runner_id, LogLevel::Info, "Stopped.".into());
-            self.set_state(&mut inner, runner_id, RunnerState::Stopped);
-            self.persist(&mut inner);
+        if discard {
+            inner.slots.remove(runner_id);
+            self.launcher.forget(runner_id);
         } else {
-            self.crashed(&mut inner, runner_id, &format!("exited unexpectedly: {reason}"));
+            match exit {
+                RunnerExit::Crashed(reason) if state != RunnerState::Stopping && !was_draining && !terminated => {
+                    self.crashed(inner, runner_id, &format!("exited unexpectedly: {reason}"));
+                }
+                RunnerExit::Crashed(reason) => {
+                    self.log(inner, runner_id, LogLevel::Warning, format!("Stopped: {reason}."));
+                    self.set_state(inner, runner_id, RunnerState::Stopped);
+                }
+                RunnerExit::Finished(_) | RunnerExit::Idle | RunnerExit::Vanished => {
+                    inner.slots.get_mut(runner_id).unwrap().crashes = 0;
+                    self.log(inner, runner_id, LogLevel::Info, "Exited.".into());
+                    self.set_state(inner, runner_id, RunnerState::Stopped);
+                }
+            }
         }
-        self.refresh_admission(&mut inner);
+        self.persist(inner);
+        self.refresh_admission(inner);
     }
 
     // MARK: Configuration
@@ -423,21 +550,74 @@ impl Supervisor {
         Ok(self.status_locked(&inner))
     }
 
+    pub fn max_concurrent_tasks(&self) -> u32 {
+        self.lock().stored.max_concurrent_tasks
+    }
+
     pub fn set_connection(&self, connection: Connection) {
         let mut inner = self.lock();
+        self.set_connection_locked(&mut inner, connection);
+    }
+
+    fn set_connection_locked(&self, inner: &mut Inner, connection: Connection) {
         if inner.stored.connection == connection {
             return;
         }
         inner.stored.connection = connection.clone();
-        self.emit(&mut inner, EventKind::ConnectionChanged { connection });
-        self.persist(&mut inner);
-        self.refresh_admission(&mut inner);
+        self.emit(inner, EventKind::ConnectionChanged { connection });
+        self.persist(inner);
+        self.refresh_admission(inner);
+        self.drain_surplus(inner, None);
     }
 
-    /// Removes the association: no more admissions, idle runners stop at the next tick, busy
-    /// ones finish their task.
-    pub fn disassociate(&self) {
-        self.set_connection(Connection::NotAssociated);
+    pub fn set_machine_id(&self, machine_id: Option<String>) {
+        let mut inner = self.lock();
+        inner.stored.machine_id = machine_id;
+        self.persist(&mut inner);
+    }
+
+    pub fn machine_id(&self) -> Option<String> {
+        self.lock().stored.machine_id.clone()
+    }
+
+    pub fn set_pending_revocation(&self, request: Option<crate::persist::RevocationRequest>) {
+        let mut inner = self.lock();
+        inner.stored.pending_revocation = request;
+        self.persist(&mut inner);
+    }
+
+    pub fn pending_revocation(&self) -> Option<crate::persist::RevocationRequest> {
+        self.lock().stored.pending_revocation.clone()
+    }
+
+    /// Disassociation or revocation (B7, an exception to "never interrupt"): no more launches,
+    /// every live runner is terminated (graceful signal, then killed after the grace period),
+    /// and every runner record is erased with its local files once its process is gone.
+    pub fn end_association(&self, connection: Connection) {
+        let mut inner = self.lock();
+        self.set_connection_locked(&mut inner, connection);
+        inner.stored.machine_id = None;
+        let ids: Vec<RunnerId> = inner.slots.keys().cloned().collect();
+        let now = self.now();
+        for id in ids {
+            let live = inner.slots[&id].state.is_live();
+            if live {
+                let record = {
+                    let slot = inner.slots.get_mut(&id).unwrap();
+                    slot.discard = true;
+                    slot.terminating = true;
+                    slot.kill_at_ms = Some(now + self.options.kill_grace_ms);
+                    slot.record.clone()
+                };
+                self.log(&mut inner, &id, LogLevel::Warning, "Stopping: the machine is no longer associated.".into());
+                self.set_state(&mut inner, &id, RunnerState::Stopping);
+                self.launcher.terminate(&record, false);
+            } else {
+                inner.slots.remove(&id);
+                self.launcher.forget(&id);
+            }
+        }
+        self.persist(&mut inner);
     }
 
     pub fn set_load(&self, sample: LoadSample) {
@@ -452,6 +632,21 @@ impl Supervisor {
         }
     }
 
+    /// Records a line a runner wrote, masked first.
+    pub fn runner_output(&self, runner_id: &str, generation: u64, line: &str) {
+        let mut inner = self.lock();
+        if Self::current(&inner, runner_id, generation).is_ok() {
+            let line: String = line.chars().take(2_000).collect();
+            self.log(&mut inner, runner_id, LogLevel::Info, line);
+        }
+    }
+
+    /// Records a service-level error, masked.
+    pub fn report_error(&self, message: &str) {
+        let mut inner = self.lock();
+        self.emit_error(&mut inner, message);
+    }
+
     // MARK: Diagnostics (not the main path)
 
     pub fn add_runner(&self, name: &str, start_now: bool) -> Result<RunnerView, ServiceError> {
@@ -460,44 +655,69 @@ impl Supervisor {
             return Err(ServiceError::NotAssociated);
         }
         let name = validate_runner_name(name)?;
-        if inner.slots.values().any(|s| s.record.name.to_lowercase() == name.to_lowercase()) {
+        if inner.slots.values().any(|s| s.record.name.eq_ignore_ascii_case(&name)) {
             return Err(ServiceError::DuplicateName(name));
         }
-        let id = self.provision(&mut inner, Some(name), true)?;
+        if inner.slots.len() >= MAX_RUNNERS {
+            return Err(ServiceError::InvalidArgument {
+                field: "name".into(),
+                reason: format!("at most {MAX_RUNNERS} runners"),
+            });
+        }
+        let id = self.create(&mut inner, Some(name), true);
         if start_now {
-            inner.slots.get_mut(&id).unwrap().held = false;
-            self.spawn(&mut inner, &id);
+            self.start_locked(&mut inner, &id)?;
         }
         Ok(self.view(&inner.slots[&id]))
     }
 
+    /// Starts a runner by hand. Same regulation as automatic launches: never past the ceiling,
+    /// never while paused or blocked, never in another scope than the live runners.
     pub fn start_runner(&self, runner_id: &str) -> Result<RunnerView, ServiceError> {
         let mut inner = self.lock();
-        let slot = inner.slots.get_mut(runner_id).ok_or(ServiceError::RunnerNotFound)?;
-        if !matches!(slot.state, RunnerState::Stopped | RunnerState::Failed) {
+        self.start_locked(&mut inner, runner_id)?;
+        Ok(self.view(&inner.slots[runner_id]))
+    }
+
+    fn start_locked(&self, inner: &mut Inner, runner_id: &str) -> Result<(), ServiceError> {
+        let slot = inner.slots.get(runner_id).ok_or(ServiceError::RunnerNotFound)?;
+        if !matches!(slot.state, RunnerState::Stopped | RunnerState::Failed) || slot.discard {
             return Err(ServiceError::InvalidTransition { from: slot.state, action: "start".into() });
         }
+        let live = Self::live_scopes(inner);
+        let scope = inner.regulator.may_launch_one(&live, inner.last_queue.as_ref())?;
+        let slot = inner.slots.get_mut(runner_id).unwrap();
         slot.held = false;
         slot.crashes = 0;
         slot.failure = None;
         slot.restart_at_ms = None;
-        self.spawn(&mut inner, runner_id);
-        Ok(self.view(&inner.slots[runner_id]))
+        self.launch(inner, runner_id, scope);
+        Ok(())
     }
 
-    /// Stops a runner by hand. A busy runner is only stopped with `force` (the interface asks
-    /// for a confirmation first); its task then follows Nestor's existing policy.
+    /// Stops a runner by hand. Without a job it is drained. A busy runner is only stopped with
+    /// `force` (the interface asks for a confirmation first): it is terminated, which ends its
+    /// task; Nestor's existing policy decides what happens to it.
     pub fn stop_runner(&self, runner_id: &str, force: bool) -> Result<RunnerView, ServiceError> {
         let mut inner = self.lock();
         let slot = inner.slots.get_mut(runner_id).ok_or(ServiceError::RunnerNotFound)?;
         match slot.state {
-            RunnerState::Starting | RunnerState::Ready => {}
-            RunnerState::Busy if force => {}
+            RunnerState::Starting | RunnerState::Ready => {
+                slot.held = true;
+                self.log(&mut inner, runner_id, LogLevel::Info, "Stop requested from the diagnostics.".into());
+                self.drain(&mut inner, runner_id);
+            }
+            RunnerState::Busy | RunnerState::Stopping if force => {
+                slot.held = true;
+                slot.terminating = true;
+                slot.kill_at_ms = Some(self.now() + self.options.kill_grace_ms);
+                let record = slot.record.clone();
+                self.log(&mut inner, runner_id, LogLevel::Warning, "Forced stop from the diagnostics.".into());
+                self.set_state(&mut inner, runner_id, RunnerState::Stopping);
+                self.launcher.terminate(&record, false);
+            }
             from => return Err(ServiceError::InvalidTransition { from, action: "stop".into() }),
         }
-        slot.held = true;
-        self.log(&mut inner, runner_id, LogLevel::Info, "Stop requested from the diagnostics.".into());
-        self.terminate(&mut inner, runner_id);
         Ok(self.view(&inner.slots[runner_id]))
     }
 
@@ -508,7 +728,7 @@ impl Supervisor {
             return Err(ServiceError::InvalidTransition { from: slot.state, action: "remove".into() });
         }
         inner.slots.remove(runner_id);
-        self.launcher.deprovision(runner_id);
+        self.launcher.forget(runner_id);
         self.persist(&mut inner);
         Ok(())
     }
@@ -527,6 +747,18 @@ impl Supervisor {
     pub fn runner(&self, runner_id: &str) -> Option<RunnerView> {
         let inner = self.lock();
         inner.slots.get(runner_id).map(|s| self.view(s))
+    }
+
+    /// Process ids of the live runners, to refuse them on the local API.
+    pub fn runner_pids(&self) -> Vec<u32> {
+        let inner = self.lock();
+        inner.slots.values().filter(|s| s.state.is_live()).filter_map(|s| s.record.pid).collect()
+    }
+
+    /// The records of the live runners (for the launcher's shutdown).
+    pub fn live_records(&self) -> Vec<RunnerRecord> {
+        let inner = self.lock();
+        inner.slots.values().filter(|s| s.state.is_live()).map(|s| s.record.clone()).collect()
     }
 
     pub fn logs(&self, runner_id: &str, limit: usize) -> Result<Vec<LogEntry>, ServiceError> {
@@ -563,15 +795,26 @@ impl Supervisor {
         }
     }
 
-    fn provisioned(inner: &Inner) -> u32 {
-        inner.slots.values().filter(|s| !s.record.manual).count() as u32
+    fn live_scopes(inner: &Inner) -> Vec<LiveScope> {
+        inner
+            .slots
+            .values()
+            .filter(|s| s.state.is_live())
+            .map(|s| {
+                if s.scope_violated {
+                    LiveScope::Violated
+                } else {
+                    match &s.record.scope {
+                        Some(scope) => LiveScope::Pinned(scope.clone()),
+                        None => LiveScope::Unknown,
+                    }
+                }
+            })
+            .collect()
     }
 
-    fn holder(inner: &Inner, token: &Token) -> Result<(), ServiceError> {
-        match inner.regulator.token_of(&token.runner_id) {
-            Some(held) if held == token => Ok(()),
-            _ => Err(ServiceError::InvalidArgument { field: "token".into(), reason: "not held".into() }),
-        }
+    fn automatic(inner: &Inner) -> u32 {
+        inner.slots.values().filter(|s| !s.record.manual).count() as u32
     }
 
     fn check_revision(inner: &Inner, expected: Option<u64>) -> Result<(), ServiceError> {
@@ -590,9 +833,10 @@ impl Supervisor {
         self.emit(inner, EventKind::ConfigChanged { revision, mode, max_concurrent_tasks: max });
         self.persist(inner);
         self.refresh_admission(inner);
+        self.drain_surplus(inner, None);
     }
 
-    fn provision(&self, inner: &mut Inner, name: Option<String>, manual: bool) -> Result<RunnerId, ServiceError> {
+    fn create(&self, inner: &mut Inner, name: Option<String>, manual: bool) -> RunnerId {
         let id = new_id();
         let name = name.unwrap_or_else(|| {
             (1..)
@@ -600,8 +844,16 @@ impl Supervisor {
                 .find(|candidate| !inner.slots.values().any(|s| &s.record.name == candidate))
                 .unwrap()
         });
-        let record = RunnerRecord { id: id.clone(), name, generation: 0, pid: None, created_at_ms: self.now(), manual };
-        self.launcher.provision(&record)?;
+        let record = RunnerRecord {
+            id: id.clone(),
+            name,
+            generation: 0,
+            pid: None,
+            start_time_us: None,
+            scope: None,
+            created_at_ms: self.now(),
+            manual,
+        };
         let mut slot = Slot::new(record, RunnerState::Stopped);
         slot.held = manual;
         inner.slots.insert(id.clone(), slot);
@@ -609,39 +861,71 @@ impl Supervisor {
             inner,
             &id,
             LogLevel::Info,
-            if manual { "Added from the diagnostics.".into() } else { "Provisioned by the service.".into() },
+            if manual { "Added from the diagnostics.".into() } else { "Created by the service.".into() },
         );
         self.persist(inner);
-        Ok(id)
+        id
     }
 
-    fn spawn(&self, inner: &mut Inner, runner_id: &str) {
+    fn launch(&self, inner: &mut Inner, runner_id: &str, scope: Option<ScopeId>) {
         let record = {
             let slot = inner.slots.get_mut(runner_id).unwrap();
             debug_assert!(!slot.state.is_live(), "never launch over a live runner");
             slot.record.generation += 1;
+            slot.record.scope = scope;
             slot.restart_at_ms = None;
+            slot.draining = false;
+            slot.idle_since_ms = Some(self.now());
             slot.record.clone()
         };
         self.set_state(inner, runner_id, RunnerState::Starting);
         match self.launcher.spawn(&record) {
-            Ok(pid) => {
-                inner.slots.get_mut(runner_id).unwrap().record.pid = Some(pid);
-                self.log(inner, runner_id, LogLevel::Info, format!("Started (generation {}).", record.generation));
+            Ok(identity) => {
+                {
+                    let slot = inner.slots.get_mut(runner_id).unwrap();
+                    slot.record.pid = Some(identity.pid);
+                    slot.record.start_time_us = Some(identity.start_time_us);
+                }
+                self.log(
+                    inner,
+                    runner_id,
+                    LogLevel::Info,
+                    format!("Launched for one task (generation {}).", record.generation),
+                );
                 self.persist(inner);
             }
-            Err(reason) => self.crashed(inner, runner_id, &format!("could not start: {reason}")),
+            Err(reason) => {
+                inner.slots.get_mut(runner_id).unwrap().record.scope = None;
+                self.crashed(inner, runner_id, &format!("could not start: {reason}"));
+            }
         }
     }
 
-    /// An exit nobody asked for: restart later with an exponential backoff, or leave the runner
-    /// `failed` after `max_crashes` in a row.
+    fn drain(&self, inner: &mut Inner, runner_id: &str) {
+        let record = {
+            let slot = inner.slots.get_mut(runner_id).unwrap();
+            slot.draining = true;
+            slot.record.clone()
+        };
+        if record.pid.is_some() {
+            self.set_state(inner, runner_id, RunnerState::Stopping);
+            self.launcher.drain(&record);
+        } else {
+            inner.slots.get_mut(runner_id).unwrap().draining = false;
+            self.set_state(inner, runner_id, RunnerState::Stopped);
+            self.persist(inner);
+        }
+    }
+
+    /// An exit nobody asked for: may launch again after an exponential backoff, or the runner
+    /// is left `failed` after `max_crashes` in a row.
     fn crashed(&self, inner: &mut Inner, runner_id: &str, reason: &str) {
         let now = self.now();
         let options = self.options.clone();
         let next = {
             let slot = inner.slots.get_mut(runner_id).unwrap();
             slot.record.pid = None;
+            slot.record.start_time_us = None;
             slot.crashes += 1;
             if slot.crashes >= options.max_crashes {
                 slot.failure = Some(format!("Exited {} times in a row; last: {reason}", slot.crashes));
@@ -656,22 +940,6 @@ impl Supervisor {
         self.log(inner, runner_id, LogLevel::Error, capitalized(reason));
         self.set_state(inner, runner_id, next);
         self.persist(inner);
-    }
-
-    fn terminate(&self, inner: &mut Inner, runner_id: &str) {
-        let (generation, pid) = {
-            let slot = &inner.slots[runner_id];
-            (slot.record.generation, slot.record.pid)
-        };
-        self.set_state(inner, runner_id, RunnerState::Stopping);
-        match pid {
-            Some(pid) => self.launcher.terminate(runner_id, generation, pid),
-            None => {
-                // Nothing to wait for.
-                self.set_state(inner, runner_id, RunnerState::Stopped);
-                self.persist(inner);
-            }
-        }
     }
 
     fn set_state(&self, inner: &mut Inner, runner_id: &str, state: RunnerState) {
@@ -694,7 +962,7 @@ impl Supervisor {
             Some(BlockReason::Reconciling)
         } else {
             match inner.stored.connection {
-                Connection::NotAssociated => Some(BlockReason::NotAssociated),
+                Connection::NotAssociated | Connection::Associating { .. } => Some(BlockReason::NotAssociated),
                 Connection::Unreachable { .. } => Some(BlockReason::Unreachable),
                 Connection::Revoked => Some(BlockReason::Revoked),
                 Connection::Associated { .. } => None,
@@ -710,9 +978,19 @@ impl Supervisor {
 
     fn persist(&self, inner: &mut Inner) {
         inner.stored.runners = inner.slots.values().map(|s| s.record.clone()).collect();
-        if let Err(error) = self.store.save(&inner.stored) {
-            self.emit(inner, EventKind::ServiceError { message: format!("Could not save the configuration: {error}") });
+        let mut stored = inner.stored.clone();
+        // An association in progress is never stored: its device code lives in memory only.
+        if matches!(stored.connection, Connection::Associating { .. }) {
+            stored.connection = Connection::NotAssociated;
         }
+        if let Err(error) = self.store.save(&stored) {
+            self.emit_error(inner, &format!("Could not save the configuration: {error}"));
+        }
+    }
+
+    fn emit_error(&self, inner: &mut Inner, message: &str) {
+        let message = self.redactor.mask(message);
+        self.emit(inner, EventKind::ServiceError { message });
     }
 
     fn emit(&self, inner: &mut Inner, kind: EventKind) {
@@ -724,7 +1002,9 @@ impl Supervisor {
         }
     }
 
+    /// Every runner log line is masked here, at the source (N5).
     fn log(&self, inner: &mut Inner, runner_id: &str, level: LogLevel, message: String) {
+        let message = self.redactor.mask(&message);
         let message = match self.options.service_mode {
             ServiceMode::Demo => format!("[demo] {message}"),
             ServiceMode::Live => message,
@@ -746,6 +1026,7 @@ impl Supervisor {
             generation: slot.record.generation,
             failure_reason: slot.failure.clone(),
             task_ref: slot.task_ref.clone(),
+            scope: slot.record.scope.clone(),
             created_at_ms: slot.record.created_at_ms,
             last_task_at_ms: slot.last_task_at_ms,
             measured_cpu_percent: slot.usage.0,
@@ -774,7 +1055,9 @@ impl Supervisor {
             max_concurrent_tasks: inner.stored.max_concurrent_tasks,
             max_concurrent_tasks_upper_bound: self.options.ceiling_upper_bound,
             config_revision: inner.stored.config_revision,
-            busy_runners: inner.regulator.busy(),
+            busy_runners: inner.slots.values().filter(|s| s.state == RunnerState::Busy).count() as u32,
+            live_runners: inner.slots.values().filter(|s| s.state.is_live()).count() as u32,
+            active_scope: Regulator::active_scope(&Self::live_scopes(inner)).ok().flatten(),
             active_tasks,
             load: inner.load.clone(),
             config_error: inner.config_error.clone(),
@@ -787,6 +1070,11 @@ impl Slot {
         Slot {
             held: record.manual,
             adopted: false,
+            draining: false,
+            terminating: false,
+            kill_at_ms: None,
+            scope_violated: false,
+            discard: false,
             record,
             state,
             failure: None,
@@ -812,7 +1100,8 @@ fn outcome_text(outcome: TaskOutcome) -> &'static str {
         TaskOutcome::Succeeded => "succeeded",
         TaskOutcome::Failed => "failed",
         TaskOutcome::RunnerLost => "runner lost",
-        TaskOutcome::NotClaimed => "not claimed",
+        TaskOutcome::Stopped => "stopped",
+        TaskOutcome::Unknown => "outcome unknown",
     }
 }
 

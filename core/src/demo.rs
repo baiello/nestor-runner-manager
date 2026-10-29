@@ -1,48 +1,68 @@
-//! The simulated Nestor queue behind `nestor-runner-service --simulate`.
+//! The simulated Nestor behind `nestor-runner-service --simulate`.
 //!
-//! DEMO ONLY: the tasks, the association and the runner processes are invented. The supervisor,
-//! the admission rules, the persistence and the local API are the real ones, so the interface can
-//! be exercised end to end; the service reports `serviceMode: demo` and prefixes its logs with
-//! `[demo]`.
+//! DEMO ONLY: the server ([`FakeNestor`], approving every association), the tasks and the runner
+//! processes are invented. The supervisor, the admission rules, the association flow, the
+//! persistence and the local API are the real ones, so the interface can be exercised end to
+//! end. The service reports `serviceMode: demo`, prefixes its logs with `[demo]`, and keeps its
+//! secrets in memory only: a demo service never touches the Keychain (N8).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::admission::Token;
 use crate::fake::FakeLauncher;
-use crate::model::{RunnerState, TaskOutcome};
+use crate::model::{Queue, RunnerExit, RunnerState, TaskOutcome};
+use crate::nestor::FakeNestor;
 use crate::supervisor::Supervisor;
+
+pub const DEMO_INSTANCE: &str = "demo.nestor.invalid";
+pub const DEMO_SCOPES: [&str; 2] = ["demo-workspace-a", "demo-workspace-b"];
 
 pub struct DemoQueue {
     supervisor: Arc<Supervisor>,
     launcher: Arc<FakeLauncher>,
-    pending: u32,
+    nestor: Arc<FakeNestor>,
+    pending: BTreeMap<String, u32>,
     next_task: u64,
-    running: BTreeMap<String, (Token, u64)>,
+    /// Runner id → (pid, generation, end of its task).
+    running: BTreeMap<String, (u32, u64, u64)>,
     ticks: u64,
 }
 
 impl DemoQueue {
-    pub fn new(supervisor: Arc<Supervisor>, launcher: Arc<FakeLauncher>) -> Self {
-        DemoQueue { supervisor, launcher, pending: 3, next_task: 1, running: BTreeMap::new(), ticks: 0 }
+    pub fn new(supervisor: Arc<Supervisor>, launcher: Arc<FakeLauncher>, nestor: Arc<FakeNestor>) -> Self {
+        let pending = BTreeMap::from([(DEMO_SCOPES[0].to_string(), 3), (DEMO_SCOPES[1].to_string(), 1)]);
+        DemoQueue { supervisor, launcher, nestor, pending, next_task: 1, running: BTreeMap::new(), ticks: 0 }
     }
 
-    pub fn pending(&self) -> u32 {
-        self.pending
+    pub fn queue(&self) -> Queue {
+        Queue { eligible: self.pending.iter().filter(|(_, n)| **n > 0).map(|(s, n)| (s.clone(), *n)).collect() }
     }
 
     /// One second of simulated life.
     pub fn step(&mut self, now_ms: u64) {
         self.ticks += 1;
+        self.nestor.set_now(now_ms);
         if self.ticks.is_multiple_of(20) {
-            self.pending = (self.pending + 2).min(6);
+            let scope = DEMO_SCOPES[(self.ticks / 20 % 2) as usize].to_string();
+            let entry = self.pending.entry(scope).or_default();
+            *entry = (*entry + 2).min(6);
         }
 
-        // Pretend processes: stop those asked to stop, bring the starting ones up.
-        for process in self.launcher.terminating() {
-            self.launcher.end(process.pid);
-            self.running.remove(&process.runner_id);
-            self.supervisor.runner_exited(&process.runner_id, process.generation, "stopped");
+        // Pretend processes: terminated ones end now; drained ones end now unless they hold a task.
+        for process in self.launcher.live() {
+            let busy = self.running.contains_key(&process.runner_id);
+            if process.terminated || process.killed {
+                self.launcher.end(process.pid);
+                self.running.remove(&process.runner_id);
+                self.supervisor.runner_exited(
+                    &process.runner_id,
+                    process.generation,
+                    RunnerExit::Crashed("terminated".into()),
+                );
+            } else if process.drained && !busy {
+                self.launcher.end(process.pid);
+                self.supervisor.runner_exited(&process.runner_id, process.generation, RunnerExit::Idle);
+            }
         }
         for runner in self.supervisor.runners() {
             if runner.state == RunnerState::Starting {
@@ -50,39 +70,37 @@ impl DemoQueue {
             }
         }
 
-        // Finish the tasks that are due.
+        // Tasks that are due end, and their one-job runner exits.
         let due: Vec<String> =
-            self.running.iter().filter(|(_, (_, end))| *end <= now_ms).map(|(id, _)| id.clone()).collect();
+            self.running.iter().filter(|(_, (_, _, end))| *end <= now_ms).map(|(id, _)| id.clone()).collect();
         for runner_id in due {
-            if let Some((token, _)) = self.running.remove(&runner_id) {
-                let _ = self.supervisor.task_finished(&token, TaskOutcome::Succeeded);
-                self.supervisor.set_runner_usage(&runner_id, 0.4, 180 << 20);
+            if let Some((pid, generation, _)) = self.running.remove(&runner_id) {
+                self.launcher.end(pid);
+                self.supervisor.runner_exited(&runner_id, generation, RunnerExit::Finished(TaskOutcome::Succeeded));
             }
         }
 
-        // Ready runners ask for a token, then claim a simulated task.
+        // Waiting runners claim one simulated task of their scope.
         for runner in self.supervisor.runners() {
-            if self.pending == 0 {
-                break;
-            }
-            if runner.state != RunnerState::Ready {
+            if runner.state != RunnerState::Ready || self.running.contains_key(&runner.id) {
                 continue;
             }
-            if let Ok(token) = self.supervisor.admit(&runner.id, runner.generation) {
-                let task_ref = format!("demo-task-{}", self.next_task);
-                let duration_ms = 15_000 + (self.next_task % 4) * 10_000;
-                self.next_task += 1;
-                self.pending -= 1;
-                let _ = self.supervisor.task_started(&token, &task_ref);
+            let Some(process) = self.launcher.live_for(&runner.id).into_iter().find(|p| !p.drained) else { continue };
+            let scope = process.scope.clone().unwrap_or_else(|| DEMO_SCOPES[0].to_string());
+            let Some(count) = self.pending.get_mut(&scope).filter(|n| **n > 0) else { continue };
+            *count -= 1;
+            let task_ref = format!("demo-task-{}", self.next_task);
+            let duration_ms = 15_000 + (self.next_task % 4) * 10_000;
+            self.next_task += 1;
+            if self.supervisor.runner_claimed(&runner.id, runner.generation, &task_ref, Some(&scope)).is_ok() {
                 self.supervisor.set_runner_usage(
                     &runner.id,
                     180.0 + (self.next_task % 5) as f64 * 40.0,
                     (2 + self.next_task % 6) << 30,
                 );
-                self.running.insert(runner.id.clone(), (token, now_ms + duration_ms));
+                self.running.insert(runner.id.clone(), (process.pid, runner.generation, now_ms + duration_ms));
             }
         }
-
-        self.supervisor.tick(self.pending);
+        self.nestor.set_queue(self.queue());
     }
 }

@@ -4,9 +4,57 @@
 //! this model (KCA-714). The concurrency ceiling regulates how many tasks are *admitted*, which
 //! is a different thing from a resource quota.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 pub type RunnerId = String;
+
+/// Nestor's opaque identifier of the scope (workspace) a job belongs to. The service never sees
+/// a workspace's name or content, only this identifier, to keep tasks of different scopes apart
+/// when more than one runs at a time (decision B1(b), contract v2).
+pub type ScopeId = String;
+
+/// What Nestor offers this machine right now: the number of eligible jobs per scope, capped by
+/// the server, without any content (`GET /machine/queue`, S4).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Queue {
+    pub eligible: BTreeMap<ScopeId, u32>,
+}
+
+impl Queue {
+    pub fn empty() -> Self {
+        Queue::default()
+    }
+
+    /// `count` eligible jobs in a single scope.
+    pub fn single(scope: &str, count: u32) -> Self {
+        let mut eligible = BTreeMap::new();
+        if count > 0 {
+            eligible.insert(scope.to_string(), count);
+        }
+        Queue { eligible }
+    }
+
+    pub fn total(&self) -> u32 {
+        self.eligible.values().fold(0u32, |sum, n| sum.saturating_add(*n))
+    }
+
+    pub fn in_scope(&self, scope: &str) -> u32 {
+        self.eligible.get(scope).copied().unwrap_or(0)
+    }
+
+    /// The scope with the most eligible jobs; ties go to the smallest identifier, so the choice
+    /// is deterministic.
+    pub fn busiest(&self) -> Option<(&ScopeId, u32)> {
+        self.eligible
+            .iter()
+            .filter(|(_, n)| **n > 0)
+            .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+            .map(|(scope, n)| (scope, *n))
+    }
+}
 
 /// Whether the data behind the service is real. The interface shows its demo banner whenever
 /// this is not `Live`, and must never infer `Live` from anything else.
@@ -50,6 +98,16 @@ pub enum Admission {
 #[serde(rename_all = "camelCase", tag = "state")]
 pub enum Connection {
     NotAssociated,
+    /// A device authorization is in progress: the user approves it on the Nestor web app with
+    /// `user_code`. Nothing secret is shown: the user code alone grants nothing, the approval
+    /// needs an administrator's session on the web (decision B6).
+    #[serde(rename_all = "camelCase")]
+    Associating {
+        instance: String,
+        user_code: String,
+        verification_uri: String,
+        expires_at_ms: u64,
+    },
     #[serde(rename_all = "camelCase")]
     Associated {
         instance: String,
@@ -60,11 +118,20 @@ pub enum Connection {
         instance: String,
         reason: String,
     },
+    /// Nestor revoked the machine: runners were stopped and secrets erased. Associate again to
+    /// take tasks.
     Revoked,
 }
 
-/// A runner's lifecycle. A runner takes one task at a time: `Busy` means it holds an admission
-/// token and is claiming or running its task.
+impl Connection {
+    pub fn is_associated(&self) -> bool {
+        matches!(self, Connection::Associated { .. } | Connection::Unreachable { .. })
+    }
+}
+
+/// A runner's lifecycle. A managed runner is a "one job" process: it is launched (`Starting`),
+/// comes up and asks Nestor for one job (`Ready`), runs it (`Busy`), then exits (`Stopped`).
+/// Launching it *is* the admission: there is no local token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RunnerState {
@@ -72,6 +139,8 @@ pub enum RunnerState {
     Starting,
     Ready,
     Busy,
+    /// Asked to stop: drained (no new claim, its job if any finishes) or, on revocation and
+    /// forced stops only, terminated.
     Stopping,
     Failed,
 }
@@ -101,6 +170,8 @@ pub struct RunnerView {
     pub generation: u64,
     pub failure_reason: Option<String>,
     pub task_ref: Option<String>,
+    /// The scope this runner may claim from, when more than one task may run at a time.
+    pub scope: Option<ScopeId>,
     pub created_at_ms: u64,
     pub last_task_at_ms: Option<u64>,
     /// Measured, not capped.
@@ -153,6 +224,12 @@ pub struct MachineStatus {
     pub max_concurrent_tasks_upper_bound: u32,
     pub config_revision: u64,
     pub busy_runners: u32,
+    /// Runner processes alive (starting, waiting for a job, busy or stopping). Each may hold one
+    /// job, so this is what the ceiling counts.
+    pub live_runners: u32,
+    /// Set while more than one task may run: the only scope new runners may claim from, so
+    /// tasks of different workspaces never run side by side (B1(b)). Opaque.
+    pub active_scope: Option<ScopeId>,
     pub active_tasks: Vec<ActiveTask>,
     pub load: Option<LoadSample>,
     /// Set when the stored configuration could not be read: the service then starts paused with
@@ -184,8 +261,23 @@ pub enum TaskOutcome {
     Failed,
     /// The runner died while running it; Nestor's existing policy decides what happens next.
     RunnerLost,
-    /// The runner had a token but did not get a task from Nestor.
-    NotClaimed,
+    /// The runner was stopped on purpose during its task (forced stop, revocation).
+    Stopped,
+    /// The runner was adopted after a restart and ended without the service knowing how.
+    Unknown,
+}
+
+/// How a runner process ended, as its launcher reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunnerExit {
+    /// It ran its one job and exited normally.
+    Finished(TaskOutcome),
+    /// It exited without a job: idle timeout, or drained before it claimed one.
+    Idle,
+    /// An adopted process is gone; the service did not launch it and cannot tell how it ended.
+    Vanished,
+    /// Anything else: a crash, a launch failure, a signal nobody sent.
+    Crashed(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -205,6 +297,10 @@ pub enum EventKind {
     TaskFinished { runner_id: RunnerId, task_ref: Option<String>, outcome: TaskOutcome },
     #[serde(rename = "admission.changed")]
     AdmissionChanged { admission: Admission },
+    /// A runner reported a job from another scope than the one it was launched for: Nestor did
+    /// not apply the scope filter. New launches stop until it ends (B1(b), A2).
+    #[serde(rename = "scope.violation", rename_all = "camelCase")]
+    ScopeViolation { runner_id: RunnerId },
     #[serde(rename = "service.error")]
     ServiceError { message: String },
 }
@@ -225,14 +321,29 @@ pub enum ServiceError {
     Revoked,
     Unreachable,
     Unavailable(String),
-    Conflict { current_revision: u64 },
-    InvalidArgument { field: String, reason: String },
-    LimitOutOfRange { min: u32, max: u32 },
+    Conflict {
+        current_revision: u64,
+    },
+    InvalidArgument {
+        field: String,
+        reason: String,
+    },
+    LimitOutOfRange {
+        min: u32,
+        max: u32,
+    },
     RunnerNotFound,
-    InvalidTransition { from: RunnerState, action: String },
+    InvalidTransition {
+        from: RunnerState,
+        action: String,
+    },
     DuplicateName(String),
     PermissionDenied,
-    IncompatibleVersion { supported: String },
+    /// A sensitive operation needs the interface's explicit confirmation (`confirmed: true`).
+    ConfirmationRequired(String),
+    IncompatibleVersion {
+        supported: String,
+    },
     SnapshotRequired,
     Internal(String),
 }
@@ -251,6 +362,7 @@ impl ServiceError {
             ServiceError::InvalidTransition { .. } => "invalidTransition",
             ServiceError::DuplicateName(_) => "duplicateName",
             ServiceError::PermissionDenied => "permissionDenied",
+            ServiceError::ConfirmationRequired(_) => "confirmationRequired",
             ServiceError::IncompatibleVersion { .. } => "incompatibleVersion",
             ServiceError::SnapshotRequired => "snapshotRequired",
             ServiceError::Internal(_) => "internal",
@@ -290,6 +402,7 @@ impl std::fmt::Display for ServiceError {
             }
             ServiceError::DuplicateName(name) => write!(f, "A runner named “{name}” already exists on this machine."),
             ServiceError::PermissionDenied => write!(f, "Permission denied."),
+            ServiceError::ConfirmationRequired(what) => write!(f, "Confirm first: {what}"),
             ServiceError::IncompatibleVersion { supported } => {
                 write!(f, "Incompatible service: it speaks API {supported}.")
             }
@@ -301,7 +414,9 @@ impl std::fmt::Display for ServiceError {
 
 impl std::error::Error for ServiceError {}
 
-/// Same rule as the macOS interface: 1 to 40 letters, digits, spaces, `-`, `_` or `.`.
+/// Same rule as the macOS interface: 1 to 40 ASCII letters, digits, spaces, `-`, `_` or `.`.
+/// ASCII only, so two names that look the same are the same (no Unicode normalization to get
+/// wrong); the service checks it again whatever the client did (N6).
 pub fn validate_runner_name(raw: &str) -> Result<String, ServiceError> {
     let name = raw.trim();
     let invalid = |reason: &str| ServiceError::InvalidArgument { field: "name".into(), reason: reason.into() };
@@ -311,8 +426,25 @@ pub fn validate_runner_name(raw: &str) -> Result<String, ServiceError> {
     if name.chars().count() > 40 {
         return Err(invalid("use at most 40 characters"));
     }
-    if !name.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | ' ')) {
-        return Err(invalid("use letters, digits, spaces, “-”, “_” or “.”"));
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ' ')) {
+        return Err(invalid("use letters (A to Z), digits, spaces, “-”, “_” or “.”"));
     }
     Ok(name.to_string())
+}
+
+/// A scope identifier comes from Nestor and is passed to a runner as one `argv` entry: 1 to 64
+/// ASCII letters, digits, `-` or `_`, nothing else.
+pub fn validate_scope(raw: &str) -> Result<(), ServiceError> {
+    let valid =
+        !raw.is_empty() && raw.len() <= 64 && raw.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
+    if valid {
+        Ok(())
+    } else {
+        Err(ServiceError::InvalidArgument { field: "scope".into(), reason: "not an opaque scope identifier".into() })
+    }
+}
+
+/// A runner identifier: 32 lowercase hexadecimal digits.
+pub fn is_runner_id(raw: &str) -> bool {
+    raw.len() == 32 && raw.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
