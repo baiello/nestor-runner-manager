@@ -64,8 +64,9 @@ if cargo build --release --locked --features dev-unsigned --bin nestor-runner-se
 fi
 "$here/scripts/release-service.sh"
 step "core: signing configuration (ad hoc)"
+target="$(cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
 "$here/scripts/sign-macos.sh" --identity - --kind service --identifier fr.kocoa.nestor.runner-service \
-  target/release/nestor-runner-service
+  "$target/release/nestor-runner-service"
 
 if [ "$contract" -eq 1 ]; then
   step "core: contract test with the real nestor-runner run-once"
