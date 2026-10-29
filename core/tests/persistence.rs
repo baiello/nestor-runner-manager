@@ -187,6 +187,37 @@ fn a_restarted_service_adopts_live_runners_instead_of_launching_again() {
 }
 
 #[test]
+fn what_an_adopted_or_lost_runner_left_is_swept_before_its_slot_is_freed() {
+    let dir = tempfile::tempdir().unwrap();
+    let launcher = Arc::new(FakeLauncher::new());
+    let first = Harness::with(file_store(dir.path()), launcher.clone(), options());
+    first.supervisor.reconcile();
+    first.associate();
+    first.supervisor.set_max_concurrent_tasks(2, None).unwrap();
+    assert_eq!(first.round(&queue(2)).len(), 2);
+    let lost = launcher.live().remove(0);
+    drop(first);
+    launcher.end(lost.pid);
+
+    // Ended while the service was down, leaving a process that resists the sweep.
+    launcher.set_leftovers(1);
+    let second = Harness::with(file_store(dir.path()), launcher.clone(), options());
+    second.supervisor.reconcile();
+    second.associate();
+    assert!(launcher.sweeps().contains(&lost.runner_id));
+    assert_eq!(second.supervisor.runner(&lost.runner_id).unwrap().state, RunnerState::Failed);
+
+    // The adopted one ends: swept before its slot is freed; survivors keep it.
+    let survivor = launcher.live().remove(0);
+    launcher.end(survivor.pid);
+    second.supervisor.tick(&Queue::empty());
+    assert_eq!(launcher.sweeps().iter().filter(|id| **id == survivor.runner_id).count(), 1);
+    assert_eq!(second.supervisor.runner(&survivor.runner_id).unwrap().state, RunnerState::Failed);
+    second.supervisor.tick(&queue(5));
+    assert_eq!(launcher.spawns(), 2, "no slot was freed");
+}
+
+#[test]
 fn a_reused_pid_is_never_adopted() {
     let dir = tempfile::tempdir().unwrap();
     let launcher = Arc::new(FakeLauncher::new());

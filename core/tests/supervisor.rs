@@ -269,6 +269,69 @@ fn stopping_a_busy_runner_needs_force_and_terminates_it() {
 }
 
 #[test]
+fn survivors_of_the_sweep_leave_the_runner_failed_and_keep_its_slot() {
+    let harness = Harness::associated();
+    harness.supervisor.set_max_concurrent_tasks(2, None).unwrap();
+    let runner_id = harness.round(&queue(1)).remove(0);
+    let process = harness.launcher.live_for(&runner_id).remove(0);
+    harness.supervisor.stop_runner(&runner_id, true).unwrap();
+    // It handled SIGTERM and exited 143; the sweep after its exit could not stop one process.
+    harness.launcher.end(process.pid);
+    harness.supervisor.runner_exited_after_sweep(
+        &runner_id,
+        process.generation,
+        RunnerExit::Crashed("status 143".into()),
+        1,
+    );
+    let runner = harness.supervisor.runner(&runner_id).unwrap();
+    assert_eq!(runner.state, RunnerState::Failed, "never a silent success");
+    assert!(runner.failure_reason.unwrap().contains("could not be stopped"));
+
+    // Its slot is not freed: no runner of another scope starts beside what is left.
+    harness.advance(600_000);
+    harness.supervisor.tick(&Queue::single("scope-b", 3));
+    assert_eq!(harness.launcher.spawns(), 1, "nothing launched for another scope");
+    harness.supervisor.set_max_concurrent_tasks(1, None).unwrap();
+    harness.supervisor.tick(&queue(3));
+    assert_eq!(harness.launcher.spawns(), 1, "it still counts against the ceiling");
+    let other = harness.supervisor.add_runner("other", false).unwrap();
+    assert!(harness.supervisor.start_runner(&other.id).is_err());
+
+    // Started or removed again only once a new sweep finds nothing left.
+    harness.launcher.set_leftovers(1);
+    assert!(harness.supervisor.start_runner(&runner_id).is_err());
+    assert!(harness.supervisor.remove_runner(&runner_id).is_err());
+    assert!(harness.supervisor.runner(&runner_id).is_some(), "its directory is kept");
+    assert_eq!(harness.launcher.spawns(), 1);
+    harness.launcher.set_leftovers(0);
+    harness.supervisor.start_runner(&runner_id).unwrap();
+    assert_eq!(harness.launcher.spawns(), 2);
+    assert_eq!(harness.launcher.sweeps(), vec![runner_id.clone(); 3], "start, remove, start: each sweeps first");
+}
+
+#[test]
+fn survivors_keep_a_revoked_runner_until_they_are_stopped() {
+    let harness = Harness::associated();
+    let runner_id = harness.round(&queue(1)).remove(0);
+    harness.supervisor.end_association(Connection::Revoked);
+    let process = harness.launcher.live_for(&runner_id).remove(0);
+    harness.launcher.end(process.pid);
+    harness.supervisor.runner_exited_after_sweep(
+        &runner_id,
+        process.generation,
+        RunnerExit::Crashed("status 143".into()),
+        2,
+    );
+    let runner = harness.supervisor.runner(&runner_id).expect("not erased while something it started runs");
+    assert_eq!(runner.state, RunnerState::Failed);
+    assert!(!harness.launcher.forgotten().contains(&runner_id), "its directory is kept");
+    // Ending the association again erases stopped runners, not this one.
+    harness.supervisor.end_association(Connection::NotAssociated);
+    assert!(harness.supervisor.runner(&runner_id).is_some());
+    assert!(!harness.launcher.forgotten().contains(&runner_id));
+}
+
+#[test]
 fn configuration_changes_are_versioned() {
     let harness = Harness::associated();
     let revision = harness.supervisor.status().config_revision;

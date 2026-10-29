@@ -1,4 +1,4 @@
-//! Stopping what a runner left behind after it was killed (M3, KCA-734 §4).
+//! Stopping what a runner left behind once it ended, killed or not (M3, KCA-734 §4, KCA-760).
 //!
 //! A process group is not enough: the runner puts Claude Code in a group of its own, and a
 //! process can leave its group (`setsid`). Walking the parents after the kill is useless too: the
@@ -10,7 +10,8 @@
 //!    it. Each with its pid, start time and process group. (Recent macOS versions no longer show
 //!    another process's environment, so there `HOME`/`TMPDIR` cannot be read; the current
 //!    directory and open files still can.)
-//! 2. **After** it, [`sweep`]: each process of the snapshot is killed, then its group, but only if
+//! 2. **After** it, and after **every** exit of a runner (whatever its status), [`sweep`], with the
+//!    members of its group still alive when it ended ([`group_members`]): each process of the snapshot is killed, then its group, but only if
 //!    pid and start time still match (a reused pid is never signalled); plus every process of the
 //!    same user found under the runner's directory again. Up to three passes; what survives is
 //!    reported, never treated as a success.
@@ -73,6 +74,17 @@ pub fn under_directory(directory: &Path) -> Vec<ProcessInfo> {
                         .any(|(name, value)| (name == "HOME" || name == "TMPDIR") && inside(Path::new(value)))
                 })
         })
+        .collect()
+}
+
+/// The live processes of the group `leader` leads, other than the leader. Only while the leader
+/// is not collected: until then its pid, hence the group's id, names no other process.
+pub fn group_members(leader: u32) -> Vec<ProcessInfo> {
+    sys::all_pids()
+        .into_iter()
+        .filter(|pid| *pid != leader)
+        .filter_map(sys::process_info)
+        .filter(|p| p.pgid == leader && !p.zombie)
         .collect()
 }
 

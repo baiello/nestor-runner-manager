@@ -16,7 +16,9 @@
 //! `--double-hostile` (forged and oversized reports), `--double-deaf` (ignores SIGTERM),
 //! `--double-tree` (starts processes that leave its group), `--double-connect SOCKET`,
 //! `--double-mark-credential` (creates `credential-received` in its directory as soon as a byte
-//! arrives on fd 3).
+//! arrives on fd 3), `--double-detach` (starts a child in a new session, its current directory
+//! still the runner's, and logs `detached=<pid>`), `--double-sigterm-exit CODE` (handles SIGTERM
+//! by exiting with CODE, as the real runner exits 143).
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -31,7 +33,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 const FIXTURE: &str = include_str!("../../contract/run-once-v1.json");
-const DOUBLE_VALUED: [&str; 8] = [
+const DOUBLE_VALUED: [&str; 9] = [
     "--double-failure",
     "--double-claim",
     "--double-job-ms",
@@ -40,9 +42,23 @@ const DOUBLE_VALUED: [&str; 8] = [
     "--double-exit",
     "--double-hello-generation",
     "--double-connect",
+    "--double-sigterm-exit",
 ];
-const DOUBLE_FLAGS: [&str; 5] =
-    ["--double-hostile", "--double-deaf", "--double-tree", "--double-mark-credential", "--double-exec-sleep"];
+const DOUBLE_FLAGS: [&str; 6] = [
+    "--double-hostile",
+    "--double-deaf",
+    "--double-tree",
+    "--double-mark-credential",
+    "--double-exec-sleep",
+    "--double-detach",
+];
+
+/// The status `--double-sigterm-exit` exits with.
+static SIGTERM_EXIT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(143);
+
+extern "C" fn exit_on_sigterm(_: libc::c_int) {
+    unsafe { libc::_exit(SIGTERM_EXIT.load(Ordering::SeqCst)) };
+}
 
 fn usage(reason: &str) -> ! {
     eprintln!("contract-argv=refused {reason}");
@@ -212,6 +228,26 @@ fn spawn_tree() {
     eprintln!("tree a={a} b={b} c={c}");
 }
 
+/// A child in a new session (no descendant of the runner once it exits, not in its group), its
+/// current directory the runner's: what the sweep finds by directory.
+fn spawn_detached() {
+    let child = unsafe {
+        Command::new("/bin/sleep")
+            .arg("123")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            })
+            .spawn()
+            .map(|c| c.id())
+            .unwrap_or(0)
+    };
+    eprintln!("detached={child}");
+}
+
 fn main() {
     let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
     let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -240,6 +276,10 @@ fn main() {
 
     if double.contains_key("--double-deaf") {
         unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
+    }
+    if let Some(code) = option("--double-sigterm-exit") {
+        SIGTERM_EXIT.store(code.parse().unwrap_or(143), Ordering::SeqCst);
+        unsafe { libc::signal(libc::SIGTERM, exit_on_sigterm as *const () as libc::sighandler_t) };
     }
     if let Some(socket) = option("--double-connect") {
         match std::os::unix::net::UnixStream::connect(&socket) {
@@ -285,6 +325,9 @@ fn main() {
     }
     if double.contains_key("--double-tree") {
         spawn_tree();
+    }
+    if double.contains_key("--double-detach") {
+        spawn_detached();
     }
     if double.contains_key("--double-exec-sleep") {
         // Becomes another program: same pid, an argv without the launch's marker.

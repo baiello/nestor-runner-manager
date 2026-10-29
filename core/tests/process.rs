@@ -444,6 +444,89 @@ fn a_runner_deaf_to_sigterm_is_killed_and_what_it_started_is_swept() {
     drop(setup.dir);
 }
 
+/// The pid the double logged as `detached=<pid>`, once it has.
+fn detached_child(setup: &Setup, runner_id: &str) -> Option<u32> {
+    logs(setup, runner_id).lines().find_map(|l| l.strip_prefix("detached=")?.parse().ok())
+}
+
+/// Ticks until the runner is no longer live, checking at every tick that its slot is never
+/// freed while its detached child still runs. Returns the state it ended in.
+fn until_freed(setup: &Setup, runner_id: &str, child: u32, child_start: u64) -> RunnerState {
+    let mut ended = None;
+    wait_or(
+        "the exit",
+        &mut || {
+            setup.supervisor.tick(&Queue::empty());
+            let state = state(setup, runner_id);
+            if !state.is_live() {
+                assert!(gone(child, child_start), "the slot was freed ({state:?}) while the detached child runs");
+                ended = Some(state);
+            }
+            ended.is_some()
+        },
+        &|| dump(setup),
+    );
+    ended.unwrap()
+}
+
+#[test]
+fn a_runner_that_exits_143_on_sigterm_leaves_no_detached_child() {
+    // As the real `run-once` does: SIGTERM handled, exit 143, not a death by signal (KCA-760).
+    let setup = setup(&[
+        "--double-sigterm-exit",
+        "143",
+        "--double-detach",
+        "--double-claim",
+        "t-1",
+        "--double-job-ms",
+        "60000",
+    ]);
+    setup.supervisor.tick(&Queue::single("scope-a", 1));
+    let runner = setup.supervisor.runners().remove(0);
+    wait_on(&setup, "the claim and the detached child", || {
+        setup.supervisor.status().busy_runners == 1 && detached_child(&setup, &runner.id).is_some()
+    });
+    let child = detached_child(&setup, &runner.id).unwrap();
+    let child_info = sys::process_info(child).unwrap();
+    let runner_pid = setup.supervisor.runner_pids()[0];
+    // In a new session: out of the runner's group, and no descendant once the runner exits.
+    assert_eq!(child_info.ppid, runner_pid);
+    assert_ne!(child_info.pgid, runner_pid, "out of the runner's group");
+
+    setup.supervisor.stop_runner(&runner.id, true).unwrap();
+    let ended = until_freed(&setup, &runner.id, child, child_info.start_time_us);
+    let alive = !gone(child, child_info.start_time_us);
+    if alive {
+        unsafe { libc::kill(child as libc::pid_t, libc::SIGKILL) };
+    }
+    assert!(!alive, "no child survives the stop");
+    assert_eq!(ended, RunnerState::Stopped, "{}", logs(&setup, &runner.id));
+    assert!(logs(&setup, &runner.id).contains("status 143"), "it exited 143: {}", logs(&setup, &runner.id));
+    assert!(setup.supervisor.runner(&runner.id).unwrap().failure_reason.is_none());
+    assert!(finished_with(&setup, TaskOutcome::Stopped));
+    drop(setup.dir);
+}
+
+#[test]
+fn a_runner_that_exits_0_is_swept_before_its_slot_is_freed() {
+    let setup = setup(&["--double-detach", "--double-claim", "t-1", "--double-job-ms", "300"]);
+    setup.supervisor.tick(&Queue::single("scope-a", 1));
+    let runner = setup.supervisor.runners().remove(0);
+    wait_on(&setup, "the detached child", || detached_child(&setup, &runner.id).is_some());
+    let child = detached_child(&setup, &runner.id).unwrap();
+    let child_start = sys::process_info(child).unwrap().start_time_us;
+    let ended = until_freed(&setup, &runner.id, child, child_start);
+    let alive = !gone(child, child_start);
+    if alive {
+        unsafe { libc::kill(child as libc::pid_t, libc::SIGKILL) };
+    }
+    assert!(!alive, "what a runner leaves after a normal exit is swept too");
+    assert_eq!(ended, RunnerState::Stopped);
+    assert!(finished_with(&setup, TaskOutcome::Succeeded), "{}", dump(&setup));
+    assert!(setup.supervisor.runner(&runner.id).unwrap().failure_reason.is_none());
+    drop(setup.dir);
+}
+
 #[test]
 fn a_relative_program_path_is_refused() {
     let config = ProcessConfig::new("runner".into(), vec![], "/nonexistent".into());

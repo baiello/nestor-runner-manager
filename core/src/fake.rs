@@ -43,6 +43,9 @@ struct FakeState {
     duplicate_launches: u32,
     fail_spawns: bool,
     forgotten: Vec<String>,
+    /// What every sweep reports as surviving.
+    leftovers: usize,
+    sweeps: Vec<String>,
 }
 
 impl FakeLauncher {
@@ -82,6 +85,16 @@ impl FakeLauncher {
 
     pub fn terminated(&self) -> Vec<FakeProcess> {
         self.live().into_iter().filter(|p| p.terminated || p.killed).collect()
+    }
+
+    /// Makes the next sweeps report `count` processes that could not be stopped.
+    pub fn set_leftovers(&self, count: usize) {
+        self.state.lock().unwrap().leftovers = count;
+    }
+
+    /// The runners swept, in order.
+    pub fn sweeps(&self) -> Vec<String> {
+        self.state.lock().unwrap().sweeps.clone()
     }
 
     pub fn forgotten(&self) -> Vec<String> {
@@ -163,6 +176,12 @@ impl Launcher for FakeLauncher {
         })
     }
 
+    fn sweep(&self, runner: &RunnerRecord) -> usize {
+        let mut state = self.state.lock().unwrap();
+        state.sweeps.push(runner.id.clone());
+        state.leftovers
+    }
+
     fn forget(&self, runner_id: &str) {
         self.state.lock().unwrap().forgotten.push(runner_id.to_string());
     }
@@ -224,6 +243,11 @@ impl Launcher for UnavailableLauncher {
 
     fn is_alive(&self, _runner: &RunnerRecord) -> bool {
         false
+    }
+
+    fn sweep(&self, _runner: &RunnerRecord) -> usize {
+        // Nothing was launched, so nothing was left behind.
+        0
     }
 
     fn forget(&self, _runner_id: &str) {}

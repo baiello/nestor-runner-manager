@@ -33,8 +33,11 @@
 //!   unreadable credential, 70 internal error (both crashes), 75 Nestor unreachable (backoff, not a
 //!   crash), 77 credential refused (revoked: no relaunch), a signal is a crash unless expected.
 //! - **Termination** (revocation, forced stop only): `SIGTERM` to the runner's own process group,
-//!   then `SIGKILL` and a sweep of what it left behind ([`crate::sweep`], M3), and only after
-//!   checking pid, start time and generation (B4).
+//!   then `SIGKILL`, and only after checking pid, start time and generation (B4).
+//! - **Sweep** ([`crate::sweep`], M3): **whatever the exit** (0, 143 after a `SIGTERM` it handled,
+//!   a kill…), what the runner left behind is stopped *before* the supervisor hears of the exit,
+//!   so its slot is never freed while something it started still runs. What survives leaves the
+//!   runner `failed`, its slot kept (KCA-760).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -110,6 +113,34 @@ pub struct ProcessLauncher {
     redactor: Redactor,
     supervisor: OnceLock<Weak<Supervisor>>,
     running: Arc<Mutex<BTreeMap<String, Running>>>,
+    snapshots: Snapshots,
+}
+
+/// What [`ProcessLauncher::terminate`] noted before a kill, by runner, with its generation: taken
+/// by the sweep that follows the exit.
+type Snapshots = Arc<Mutex<BTreeMap<String, (u64, Vec<sys::ProcessInfo>)>>>;
+
+fn take_snapshot(snapshots: &Snapshots, runner_id: &str, generation: u64) -> Vec<sys::ProcessInfo> {
+    let mut snapshots = snapshots.lock().unwrap();
+    match snapshots.get(runner_id) {
+        Some((noted, _)) if *noted == generation => snapshots.remove(runner_id).map(|(_, s)| s).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// Waits for `pid`, a child, to end **without collecting it**: until it is collected its pid,
+/// hence the id of the group it leads, cannot name another process.
+fn wait_ended(pid: u32) -> bool {
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        if result == 0 {
+            return true;
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return false;
+        }
+    }
 }
 
 // MARK: Reports
@@ -323,6 +354,7 @@ impl ProcessLauncher {
             redactor,
             supervisor: OnceLock::new(),
             running: Arc::new(Mutex::new(BTreeMap::new())),
+            snapshots: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -381,24 +413,6 @@ impl ProcessLauncher {
             .unwrap()
             .get(&runner.id)
             .is_some_and(|running| running.generation == runner.generation && running.pid == pid)
-    }
-
-    /// Sweeps what the runner left behind, then reports what survived (M3).
-    fn sweep_and_report(
-        supervisor: &Weak<Supervisor>,
-        snapshot: &[sys::ProcessInfo],
-        directory: &std::path::Path,
-        interval: Duration,
-        runner_id: &str,
-        generation: u64,
-    ) -> usize {
-        let remaining = sweep::sweep(snapshot, directory, interval);
-        if remaining > 0 {
-            if let Some(supervisor) = supervisor.upgrade() {
-                supervisor.sweep_failed(runner_id, generation, remaining);
-            }
-        }
-        remaining
     }
 }
 
@@ -529,6 +543,7 @@ impl Launcher for ProcessLauncher {
             generation: runner.generation,
             supervisor: self.supervisor.get().cloned().unwrap_or_default(),
             running: Arc::clone(&self.running),
+            snapshots: Arc::clone(&self.snapshots),
             redactor: self.redactor.clone(),
             interval: self.config.sweep_interval,
         }))
@@ -594,15 +609,18 @@ impl Launcher for ProcessLauncher {
             unsafe { libc::killpg(pid as libc::pid_t, libc::SIGTERM) };
             return;
         }
-        // End of the grace period: what it started is noted before the kill, then swept (M3).
+        // End of the grace period: what it started is noted before the kill, and swept after
+        // its exit (M3), by the thread that waits for it or, adopted, by the supervisor.
         let Some(directory) = self.runner_dir(&runner.id) else { return };
         let snapshot = sweep::snapshot(pid, &directory);
+        self.snapshots.lock().unwrap().insert(runner.id.clone(), (runner.generation, snapshot));
         unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
-        let supervisor = self.supervisor.get().cloned().unwrap_or_default();
-        let (id, generation, interval) = (runner.id.clone(), runner.generation, self.config.sweep_interval);
-        std::thread::spawn(move || {
-            Self::sweep_and_report(&supervisor, &snapshot, &directory, interval, &id, generation);
-        });
+    }
+
+    fn sweep(&self, runner: &RunnerRecord) -> usize {
+        let Some(directory) = self.runner_dir(&runner.id) else { return 0 };
+        let snapshot = take_snapshot(&self.snapshots, &runner.id, runner.generation);
+        sweep::sweep(&snapshot, &directory, self.config.sweep_interval)
     }
 
     fn is_alive(&self, runner: &RunnerRecord) -> bool {
@@ -612,6 +630,7 @@ impl Launcher for ProcessLauncher {
     }
 
     fn forget(&self, runner_id: &str) {
+        self.snapshots.lock().unwrap().remove(runner_id);
         if let Some(directory) = self.runner_dir(runner_id) {
             let _ = fs::remove_dir_all(directory);
         }
@@ -631,6 +650,7 @@ struct Pending {
     generation: u64,
     supervisor: Weak<Supervisor>,
     running: Arc<Mutex<BTreeMap<String, Running>>>,
+    snapshots: Snapshots,
     redactor: Redactor,
     interval: Duration,
 }
@@ -691,8 +711,11 @@ impl PendingLaunch for Pending {
         let control = child.stdin.take();
         self.running.lock().unwrap().insert(id.clone(), Running { generation, pid, control });
         let running = Arc::clone(&self.running);
+        let snapshots = Arc::clone(&self.snapshots);
         let redactor = self.redactor.clone();
         std::thread::spawn(move || {
+            // What is still in its group is noted before it is collected (M3).
+            let group = if wait_ended(pid) { sweep::group_members(pid) } else { Vec::new() };
             let status = child.wait();
             // A process the runner started may keep a pipe open: wait a little, not forever.
             for finished in readers_done {
@@ -711,15 +734,18 @@ impl PendingLaunch for Pending {
                 Ok(status) => classify_exit(status, claimed, finished),
                 Err(error) => RunnerExit::Crashed(error.to_string()),
             };
-            // Killed: what it started may still run (M3). Swept before its directory can be
-            // erased, reported after the exit.
-            let killed = matches!(&status, Ok(status) if status.signal().is_some());
-            let remaining = if killed { sweep::sweep(&[], &directory, interval) } else { 0 };
-            if let Some(supervisor) = supervisor.upgrade() {
-                supervisor.runner_exited(&id, generation, exit);
-                if remaining > 0 {
-                    supervisor.sweep_failed(&id, generation, remaining);
+            // Whatever the exit, what it started may still run (M3): a runner that handles
+            // SIGTERM exits 143, not by a signal, and one that exits 0 may leave a process
+            // behind. Swept before the supervisor frees its slot or erases its directory.
+            let mut snapshot = take_snapshot(&snapshots, &id, generation);
+            for process in group {
+                if !snapshot.iter().any(|p| p.pid == process.pid) {
+                    snapshot.push(process);
                 }
+            }
+            let remaining = sweep::sweep(&snapshot, &directory, interval);
+            if let Some(supervisor) = supervisor.upgrade() {
+                supervisor.runner_exited_after_sweep(&id, generation, exit, remaining);
             }
         });
     }

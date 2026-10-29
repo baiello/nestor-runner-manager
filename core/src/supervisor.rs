@@ -60,6 +60,12 @@ pub trait Launcher: Send + Sync {
     fn terminate(&self, runner: &RunnerRecord, force: bool);
     /// Whether the recorded process (pid, start time and generation) is still alive.
     fn is_alive(&self, runner: &RunnerRecord) -> bool;
+    /// Stops what an ended runner left behind (M3) and returns how many processes survived. The
+    /// real launcher does it itself after the exit of a process it launched
+    /// ([`Supervisor::runner_exited_after_sweep`]); the supervisor calls this for the others
+    /// (adopted, or found ended at startup) and before a runner left `failed` by survivors is
+    /// started or removed again. May take a few seconds when something resists.
+    fn sweep(&self, runner: &RunnerRecord) -> usize;
     /// Erases what the runner left locally (its state and work directories).
     fn forget(&self, runner_id: &str);
 }
@@ -136,6 +142,9 @@ struct Slot {
     scope_violated: bool,
     /// Removed once its process has exited (disassociation, revocation).
     discard: bool,
+    /// Processes it left behind that the sweep could not stop: the runner is `failed` and keeps
+    /// its slot (and its scope) until a later sweep finds none (KCA-760).
+    unswept: usize,
     usage: (f64, u64),
     logs: VecDeque<LogEntry>,
 }
@@ -310,6 +319,7 @@ impl Supervisor {
                     format!("Adopted process {pid} after a restart of the service."),
                 );
             } else {
+                let scope = record.scope.clone();
                 let slot = inner.slots.get_mut(&id).unwrap();
                 slot.record.pid = None;
                 slot.record.start_time_us = None;
@@ -320,6 +330,11 @@ impl Supervisor {
                     LogLevel::Warning,
                     format!("Process {pid} ended while the service was stopped."),
                 );
+                // What it left behind may still run: swept before anything is launched.
+                let remaining = self.launcher.sweep(&record);
+                if remaining > 0 {
+                    self.left_unswept(&mut inner, &id, remaining, scope);
+                }
             }
         }
         inner.reconciled = true;
@@ -384,7 +399,9 @@ impl Supervisor {
             .map(|s| (s.record.id.clone(), s.record.generation))
             .collect();
         for (id, generation) in gone {
-            self.exited(&mut inner, &id, generation, RunnerExit::Vanished);
+            // Not our child: the sweep after its exit is done here, before its slot is freed.
+            let remaining = self.launcher.sweep(&inner.slots[&id].record);
+            self.exited_swept(&mut inner, &id, generation, RunnerExit::Vanished, remaining);
         }
 
         // Terminated processes still alive after the grace period are killed.
@@ -594,23 +611,68 @@ impl Supervisor {
         self.launcher.terminate(&record, false);
     }
 
-    /// Processes a runner left behind could not be stopped after the sweep (KCA-734 §4): the
-    /// runner is left `failed` (never a silent success) and the machine raises an error.
-    pub fn sweep_failed(&self, runner_id: &str, generation: u64, remaining: usize) {
+    /// The runner's process ended and what it left behind was swept: `remaining` processes
+    /// survived. A stale generation is ignored.
+    pub fn runner_exited_after_sweep(&self, runner_id: &str, generation: u64, exit: RunnerExit, remaining: usize) {
         let mut inner = self.lock();
-        let message = format!("{remaining} process(es) started by runner {runner_id} could not be stopped.");
-        self.emit_error(&mut inner, &message);
-        let current = Self::current(&inner, runner_id, generation).is_ok_and(|s| !s.state.is_live());
-        if current {
-            {
-                let slot = inner.slots.get_mut(runner_id).unwrap();
-                slot.failure = Some(message.clone());
-                slot.held = true;
-            }
-            self.log(&mut inner, runner_id, LogLevel::Error, message);
-            self.set_state(&mut inner, runner_id, RunnerState::Failed);
-            self.persist(&mut inner);
+        self.exited_swept(&mut inner, runner_id, generation, exit, remaining);
+    }
+
+    /// Survivors of the sweep (KCA-734 §4) leave the runner `failed`, never a silent success, and
+    /// the machine raises an error. Its slot is not freed: it still counts against the ceiling,
+    /// pinned to the scope it was launched for, so no runner of another scope starts beside what
+    /// is left (KCA-760). Its directory is kept, even if it was to be removed.
+    fn exited_swept(&self, inner: &mut Inner, runner_id: &str, generation: u64, exit: RunnerExit, remaining: usize) {
+        if remaining == 0 {
+            return self.exited(inner, runner_id, generation, exit);
         }
+        let Ok(slot) = Self::current(inner, runner_id, generation) else { return };
+        if !slot.state.is_live() {
+            return;
+        }
+        let scope = slot.record.scope.clone();
+        inner.slots.get_mut(runner_id).unwrap().discard = false;
+        self.exited(inner, runner_id, generation, exit);
+        self.left_unswept(inner, runner_id, remaining, scope);
+        self.persist(inner);
+        self.refresh_admission(inner);
+    }
+
+    fn left_unswept(&self, inner: &mut Inner, runner_id: &str, remaining: usize, scope: Option<ScopeId>) {
+        let message = format!("{remaining} process(es) started by runner {runner_id} could not be stopped.");
+        self.emit_error(inner, &message);
+        {
+            let slot = inner.slots.get_mut(runner_id).unwrap();
+            slot.failure = Some(message.clone());
+            slot.held = true;
+            slot.unswept = remaining;
+            slot.restart_at_ms = None;
+            slot.record.scope = scope;
+        }
+        self.log(inner, runner_id, LogLevel::Error, message);
+        self.set_state(inner, runner_id, RunnerState::Failed);
+    }
+
+    /// Sweeps again what a runner left `failed` by survivors left behind; frees its slot once
+    /// nothing is left.
+    fn sweep_again(&self, inner: &mut Inner, runner_id: &str) -> Result<(), ServiceError> {
+        if inner.slots[runner_id].unswept == 0 {
+            return Ok(());
+        }
+        let record = inner.slots[runner_id].record.clone();
+        let remaining = self.launcher.sweep(&record);
+        if remaining > 0 {
+            inner.slots.get_mut(runner_id).unwrap().unswept = remaining;
+            return Err(ServiceError::Unavailable(format!(
+                "{remaining} process(es) started by this runner still could not be stopped."
+            )));
+        }
+        let slot = inner.slots.get_mut(runner_id).unwrap();
+        slot.unswept = 0;
+        slot.record.scope = None;
+        self.log(inner, runner_id, LogLevel::Info, "What the runner left behind is now stopped.".into());
+        self.refresh_admission(inner);
+        Ok(())
     }
 
     /// The runner's process ended. A stale generation is ignored.
@@ -857,10 +919,11 @@ impl Supervisor {
                 self.log(&mut inner, &id, LogLevel::Warning, "Stopping: the machine is no longer associated.".into());
                 self.set_state(&mut inner, &id, RunnerState::Stopping);
                 self.launcher.terminate(&record, false);
-            } else {
+            } else if inner.slots[&id].unswept == 0 {
                 inner.slots.remove(&id);
                 self.launcher.forget(&id);
             }
+            // Otherwise kept with its directory while what it left behind may run (KCA-760).
         }
         self.persist(&mut inner);
     }
@@ -930,6 +993,7 @@ impl Supervisor {
             return Err(ServiceError::InvalidTransition { from: slot.state, action: "start".into() });
         }
         Self::unresolved_launch(inner, runner_id)?;
+        self.sweep_again(inner, runner_id)?;
         let live = Self::live_scopes(inner);
         let scope = inner.regulator.may_launch_one(&live, inner.last_queue.as_ref())?;
         let slot = inner.slots.get_mut(runner_id).unwrap();
@@ -974,6 +1038,7 @@ impl Supervisor {
             return Err(ServiceError::InvalidTransition { from: slot.state, action: "remove".into() });
         }
         Self::unresolved_launch(&inner, runner_id)?;
+        self.sweep_again(&mut inner, runner_id)?;
         inner.slots.remove(runner_id);
         self.launcher.forget(runner_id);
         self.persist(&mut inner);
@@ -1046,7 +1111,8 @@ impl Supervisor {
         inner
             .slots
             .values()
-            .filter(|s| s.state.is_live())
+            // A runner whose leftovers survived the sweep keeps its slot (KCA-760).
+            .filter(|s| s.state.is_live() || s.unswept > 0)
             .map(|s| {
                 if s.scope_violated {
                     LiveScope::Violated
@@ -1411,6 +1477,7 @@ impl Slot {
             kill_at_ms: None,
             scope_violated: false,
             discard: false,
+            unswept: 0,
             record,
             state,
             failure: None,
