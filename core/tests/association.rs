@@ -162,6 +162,7 @@ fn runner_credentials_are_issued_per_launch_with_a_proof() {
         generation: 1,
         pid: None,
         start_time_us: None,
+        launching_since: None,
         scope: None,
         created_at_ms: 0,
         manual: false,

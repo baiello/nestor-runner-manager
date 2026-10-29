@@ -4,14 +4,14 @@
 //! strict reading of the reports, exit codes, process identity, masking, and the sweep of what a
 //! killed runner left behind (S8.2, S8.5, S8.6, B5, N5, KCA-734 R1 and R3).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nestor_runner_core::mask::Redactor;
 use nestor_runner_core::model::*;
-use nestor_runner_core::persist::{MemoryStore, RunnerRecord};
+use nestor_runner_core::persist::{FileStore, Loaded, MemoryStore, RunnerRecord, Store, StoredState};
 use nestor_runner_core::process::{CredentialIssuer, ProcessConfig, ProcessLauncher};
 use nestor_runner_core::secrets::Secret;
 use nestor_runner_core::supervisor::{Clock, LaunchTarget, Launcher, Options, Supervisor};
@@ -48,16 +48,21 @@ struct Setup {
 /// A supervisor on the real launcher; `double_args` are the double's own test options.
 fn setup(double_args: &[&str]) -> Setup {
     let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("runners");
+    setup_in(dir, &root, Arc::new(MemoryStore::default()), double_args)
+}
+
+/// The same, on `store`, with runners under `root`; `dir` is kept as long as the setup.
+fn setup_in(dir: tempfile::TempDir, root: &Path, store: Arc<dyn Store>, double_args: &[&str]) -> Setup {
     let redactor = Redactor::new();
     let mut base_args = vec!["run-once".to_string()];
     base_args.extend(double_args.iter().map(|s| s.to_string()));
-    let config = ProcessConfig::new(double(), base_args, dir.path().join("runners"));
+    let config = ProcessConfig::new(double(), base_args, root.to_path_buf());
     let launcher = Arc::new(ProcessLauncher::new(config, redactor.clone()).unwrap());
     let clock: Clock = Arc::new(|| SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64);
     let mut options = Options::new(ServiceMode::Live, 8);
     options.kill_grace_ms = 300;
-    let supervisor =
-        Arc::new(Supervisor::open(Arc::new(MemoryStore::default()), launcher.clone(), clock, options, redactor));
+    let supervisor = Arc::new(Supervisor::open(store, launcher.clone(), clock, options, redactor));
     let issuer = Arc::new(Issuer(AtomicU32::new(0)));
     launcher.attach(&supervisor, issuer.clone());
     supervisor.reconcile();
@@ -142,6 +147,7 @@ fn a_real_one_job_runner_is_launched_by_contract_v1_and_runs_one_task() {
         generation: busy.generation,
         pid: Some(pid),
         start_time_us: sys::process_start_time_us(pid),
+        launching_since: None,
         scope: busy.scope.clone(),
         created_at_ms: 0,
         manual: false,
@@ -190,6 +196,7 @@ fn the_launch_needs_a_machine_id_and_an_instance_of_the_right_form() {
         generation: 1,
         pid: None,
         start_time_us: None,
+        launching_since: None,
         scope: Some("scope-a".into()),
         created_at_ms: 0,
         manual: false,
@@ -406,4 +413,195 @@ fn a_runner_process_is_refused_by_the_local_api() {
     // The test process itself, not a runner, is served.
     let hello = ipc::call(&socket, &serde_json::json!({ "apiVersion": "1.1", "op": "hello" })).unwrap();
     assert_eq!(hello["result"]["access"], "full");
+}
+
+// MARK: Recoverable launch (KCA-741)
+
+/// What [`Gate`] does to the save that records a runner's pid (step 3 of a launch).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AtPidSave {
+    /// Checks the process is alive and has not got its credential, then saves.
+    Check,
+    /// Fails, as on a full disk.
+    Fail,
+    /// Never returns until thawed, then fails: the service stops right there.
+    Freeze,
+}
+
+/// A file store that watches the saves recording a pid, for the launch barrier tests.
+struct Gate {
+    inner: FileStore,
+    runners_root: PathBuf,
+    at_pid_save: AtPidSave,
+    /// The processes seen at that save (pid, start time), and whether each had its credential.
+    seen: std::sync::Mutex<Vec<(u32, u64, bool)>>,
+    frozen: std::sync::atomic::AtomicBool,
+    thawed: std::sync::atomic::AtomicBool,
+}
+
+impl Gate {
+    fn new(dir: &Path, at_pid_save: AtPidSave) -> Arc<Gate> {
+        Arc::new(Gate {
+            inner: FileStore::new(&dir.join("state")).unwrap(),
+            runners_root: dir.join("runners"),
+            at_pid_save,
+            seen: Default::default(),
+            frozen: false.into(),
+            thawed: false.into(),
+        })
+    }
+
+    fn seen(&self) -> Vec<(u32, u64, bool)> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+/// Whether the double of this runner got a byte of credential (`--double-mark-credential`).
+fn credential_received(runners_root: &Path, runner_id: &str) -> bool {
+    runners_root.join(runner_id).join("credential-received").exists()
+}
+
+impl Store for Gate {
+    fn load(&self) -> Loaded {
+        self.inner.load()
+    }
+
+    fn save(&self, state: &StoredState) -> std::io::Result<()> {
+        if self.thawed.load(Ordering::SeqCst) {
+            // The service that froze is "dead": it never writes again.
+            return Err(std::io::Error::other("the service stopped"));
+        }
+        let previous = self.inner.load();
+        let recorded = |id: &str| previous.state().runners.iter().any(|r| r.id == id && r.pid.is_some());
+        for runner in state.runners.iter().filter(|r| r.pid.is_some() && !recorded(&r.id)) {
+            let (pid, start) = (runner.pid.unwrap(), runner.start_time_us.unwrap());
+            // Long enough for a credential written early to reach the double.
+            std::thread::sleep(Duration::from_millis(150));
+            assert!(!gone(pid, start), "the process waits for its credential while its pid is saved");
+            let received = credential_received(&self.runners_root, &runner.id);
+            self.seen.lock().unwrap().push((pid, start, received));
+            match self.at_pid_save {
+                AtPidSave::Check => {}
+                AtPidSave::Fail => return Err(std::io::Error::other("no space left on device")),
+                AtPidSave::Freeze => {
+                    self.frozen.store(true, Ordering::SeqCst);
+                    while !self.thawed.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    return Err(std::io::Error::other("the service stopped"));
+                }
+            }
+        }
+        self.inner.save(state)
+    }
+}
+
+/// The live processes carrying this runner's id in their arguments, by generation.
+fn processes_of(runner_id: &str) -> Vec<(u32, String)> {
+    sys::all_pids()
+        .into_iter()
+        .filter(|pid| sys::process_info(*pid).is_some_and(|p| !p.zombie))
+        .filter_map(|pid| {
+            let arguments = sys::process_arguments(pid)?;
+            let value_of = |flag: &str| arguments.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone());
+            (value_of("--runner-id").as_deref() == Some(runner_id)).then_some(())?;
+            Some((pid, value_of("--generation")?))
+        })
+        .collect()
+}
+
+#[test]
+fn the_credential_is_written_only_after_the_pid_is_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = Gate::new(dir.path(), AtPidSave::Check);
+    let root = dir.path().join("runners");
+    let setup = setup_in(
+        dir,
+        &root,
+        gate.clone(),
+        &["--double-mark-credential", "--double-claim", "t-1", "--double-job-ms", "200"],
+    );
+    setup.supervisor.tick(&Queue::single("scope-a", 1));
+    let runner = setup.supervisor.runners().remove(0);
+
+    let seen = gate.seen();
+    assert_eq!(seen.len(), 1, "one launch, its pid saved once");
+    assert!(!seen[0].2, "no credential before the pid was saved");
+    // Saved, then released: the runner gets its credential and claims.
+    wait_on(&setup, "the claim", || setup.supervisor.status().busy_runners == 1);
+    assert!(credential_received(&root, &runner.id));
+    let stored = gate.load().state().runners[0].clone();
+    assert_eq!((stored.pid, stored.launching_since), (Some(seen[0].0), None), "pid recorded, intent cleared");
+}
+
+#[test]
+fn a_pid_that_cannot_be_saved_kills_the_process_before_its_credential() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = Gate::new(dir.path(), AtPidSave::Fail);
+    let root = dir.path().join("runners");
+    let setup = setup_in(dir, &root, gate.clone(), &["--double-mark-credential", "--double-claim", "t-1"]);
+    setup.supervisor.tick(&Queue::single("scope-a", 1));
+    let runner = setup.supervisor.runners().remove(0);
+
+    let seen = gate.seen();
+    assert_eq!(seen.len(), 1);
+    let (pid, start, received) = seen[0];
+    assert!(!received);
+    assert!(gone(pid, start), "killed before the launch returned");
+    assert!(processes_of(&runner.id).is_empty());
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!credential_received(&root, &runner.id), "no credential was ever written");
+    let text = logs(&setup, &runner.id);
+    assert!(text.contains("could not be saved") && text.contains("before getting its credential"), "{text}");
+    assert!(!text.contains("contract-argv=ok"), "the runner never got past its credential: {text}");
+    assert!(!state(&setup, &runner.id).is_live());
+    assert_eq!(setup.supervisor.runner_pids(), Vec::<u32>::new());
+}
+
+#[test]
+fn a_launch_interrupted_before_its_pid_is_saved_is_ended_at_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let root = path.join("runners");
+    let double = ["--double-mark-credential", "--double-claim", "t-1", "--double-job-ms", "200"];
+    let frozen = Gate::new(&path, AtPidSave::Freeze);
+    let first = setup_in(dir, &root, frozen.clone(), &double);
+
+    // The service stops between the spawn and the save of the pid: the process lives on,
+    // unknown to the state file but for the launch intent.
+    let ticking = Arc::clone(&first.supervisor);
+    let stuck = std::thread::spawn(move || ticking.tick(&Queue::single("scope-a", 1)));
+    wait_or("the frozen save", &mut || frozen.frozen.load(Ordering::SeqCst), &|| String::new());
+    let (orphan, orphan_start, received) = frozen.seen()[0];
+    assert!(!received);
+    let on_disk = FileStore::new(&path.join("state")).unwrap().load().state().runners[0].clone();
+    assert_eq!(on_disk.pid, None, "the pid never reached the state file");
+    let since = on_disk.launching_since.expect("the launch intent was saved before the spawn");
+    assert!(orphan_start >= since, "launched after its intent");
+    let generation = on_disk.generation.to_string();
+    assert_eq!(processes_of(&on_disk.id), vec![(orphan, generation.clone())], "a real process survives");
+
+    // A new service starts on the same state file. Nothing launches before `reconcile`, which
+    // ends the orphan.
+    let second = setup_in(tempfile::tempdir().unwrap(), &root, Gate::new(&path, AtPidSave::Check), &double);
+    assert!(gone(orphan, orphan_start), "ended by reconcile, before anything else");
+    assert!(processes_of(&on_disk.id).is_empty());
+    assert!(!credential_received(&root, &on_disk.id), "it never got a credential");
+    let text = logs(&second, &on_disk.id);
+    assert!(text.contains("Ended 1 process(es) of a launch interrupted"), "{text}");
+    let after = FileStore::new(&path.join("state")).unwrap().load().state().runners[0].clone();
+    assert_eq!(after.launching_since, None, "intent cleared");
+
+    // Then one runner, a new generation, and never two processes.
+    second.supervisor.tick(&Queue::single("scope-a", 1));
+    let live = processes_of(&on_disk.id);
+    assert_eq!(live.len(), 1, "{live:?}");
+    assert_ne!(live[0].1, generation);
+    wait_on(&second, "the claim", || second.supervisor.status().busy_runners == 1);
+    assert_eq!(processes_of(&on_disk.id).len(), 1);
+
+    // The first service never comes back.
+    frozen.thawed.store(true, Ordering::SeqCst);
+    stuck.join().unwrap();
+    drop(first);
 }

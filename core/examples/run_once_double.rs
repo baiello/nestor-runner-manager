@@ -14,7 +14,9 @@
 //! used in production): `--double-claim JOB`, `--double-job-ms N`, `--double-finish OUTCOME`,
 //! `--double-idle-ms N`, `--double-exit CODE`, `--double-hello-generation N` (lies in `hello`),
 //! `--double-hostile` (forged and oversized reports), `--double-deaf` (ignores SIGTERM),
-//! `--double-tree` (starts processes that leave its group), `--double-connect SOCKET`.
+//! `--double-tree` (starts processes that leave its group), `--double-connect SOCKET`,
+//! `--double-mark-credential` (creates `credential-received` in its directory as soon as a byte
+//! arrives on fd 3).
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -38,7 +40,7 @@ const DOUBLE_VALUED: [&str; 7] = [
     "--double-hello-generation",
     "--double-connect",
 ];
-const DOUBLE_FLAGS: [&str; 3] = ["--double-hostile", "--double-deaf", "--double-tree"];
+const DOUBLE_FLAGS: [&str; 4] = ["--double-hostile", "--double-deaf", "--double-tree", "--double-mark-credential"];
 
 fn usage(reason: &str) -> ! {
     eprintln!("contract-argv=refused {reason}");
@@ -122,11 +124,19 @@ fn open_fds() -> Vec<i32> {
 }
 
 /// Reads the credential like the runner: to the end, bounded, strict shape.
-fn read_credential(fixture: &Value) -> String {
+fn read_credential(fixture: &Value, mark: bool) -> String {
     let limit = fixture["credential"]["max_bytes"].as_u64().unwrap();
     let mut raw = Vec::new();
     let mut source = unsafe { File::from_raw_fd(3) };
-    let _ = (&mut source).take(limit + 1).read_to_end(&mut raw);
+    if mark {
+        // Blocks until the service writes or closes the pipe.
+        let mut first = [0u8; 1];
+        if source.read(&mut first).unwrap_or(0) == 1 {
+            let _ = File::create("credential-received");
+            raw.push(first[0]);
+        }
+    }
+    let _ = (&mut source).take(limit + 1 - raw.len() as u64).read_to_end(&mut raw);
     drop(source); // Closes fd 3 before any other work.
     let allowed: Vec<&String> = fixture["credential"]["fields"].as_object().unwrap().keys().collect();
     let parsed: Option<String> = (|| {
@@ -213,7 +223,7 @@ fn main() {
     for fd in inherited.iter().filter(|fd| **fd >= 5) {
         unsafe { libc::close(*fd) };
     }
-    let credential = read_credential(&fixture);
+    let credential = read_credential(&fixture, double.contains_key("--double-mark-credential"));
     let mut out = unsafe { File::from_raw_fd(4) };
 
     eprintln!("contract-argv=ok");

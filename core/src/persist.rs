@@ -33,6 +33,13 @@ pub struct RunnerRecord {
     /// generation in its arguments (B4).
     #[serde(default)]
     pub start_time_us: Option<u64>,
+    /// Set, before a process is spawned, to the time the launch began ([`crate::sys::process_clock_now`]),
+    /// and cleared in the same save that records `pid` (KCA-741). Found after a restart, it
+    /// means a process may have been spawned but never recorded: [`crate::supervisor::Supervisor::reconcile`]
+    /// ends any process carrying this generation that started since, before anything is launched.
+    /// Such a process never got its credential, so it holds no job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launching_since: Option<u64>,
     /// The scope the current process was launched for (B1(b)).
     #[serde(default)]
     pub scope: Option<ScopeId>,

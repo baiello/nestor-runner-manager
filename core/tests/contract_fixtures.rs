@@ -47,6 +47,7 @@ fn the_launch_argv_has_exactly_the_contract_options() {
         generation: 7,
         pid: None,
         start_time_us: None,
+        launching_since: None,
         // A scope planned by the supervisor is never passed (KCA-734 §3).
         scope: Some("workspace-a".into()),
         created_at_ms: 0,

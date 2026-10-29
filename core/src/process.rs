@@ -14,6 +14,9 @@
 //!   service also applies a ceiling of 1 until Nestor filters scopes at claim time (S6).
 //! - **Credential (B5, A3)**: issued by Nestor for this launch only, written as one JSON object
 //!   `{"runner_token":"…"}` to a pipe inherited as fd 3, which the service closes after writing.
+//!   Written only once the process's pid and start time are saved (KCA-741): until then the
+//!   runner waits on fd 3 and can claim nothing, so a process the service may lose track of in a
+//!   crash never holds a job. See [`crate::supervisor::PendingLaunch`].
 //!   Never in an argument, never in the environment, never in a file. Registered with the
 //!   [`Redactor`] before anything is logged, forgotten 10 minutes after the runner stops (F4). The
 //!   service holds no Claude Code token in this slice (A7): the field is left out.
@@ -40,18 +43,18 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
-use std::process::{ChildStdin, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::mask::Redactor;
+use crate::mask::{Redactor, Registration};
 use crate::model::{is_runner_id, RunnerExit, TaskOutcome};
 use crate::persist::RunnerRecord;
 use crate::secrets::Secret;
-use crate::supervisor::{LaunchTarget, Launcher, Supervisor};
+use crate::supervisor::{LaunchTarget, Launcher, PendingLaunch, Supervisor};
 use crate::sweep;
 use crate::sys::{self, ProcessIdentity};
 
@@ -397,7 +400,7 @@ fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
 }
 
 impl Launcher for ProcessLauncher {
-    fn spawn(&self, runner: &RunnerRecord, target: &LaunchTarget) -> Result<ProcessIdentity, String> {
+    fn spawn(&self, runner: &RunnerRecord, target: &LaunchTarget) -> Result<Box<dyn PendingLaunch>, String> {
         let arguments = self.arguments(runner, target)?;
         let directory = self.runner_dir(&runner.id).ok_or("invalid runner id")?;
         let home = directory.join("home");
@@ -482,92 +485,58 @@ impl Launcher for ProcessLauncher {
             });
         };
 
-        // The credential goes through the pipe once, then the pipe is closed.
-        {
-            let mut writer = fs::File::from(credential_write);
-            let _ = writer.write_all(payload.expose().as_bytes());
-        }
-        drop(payload);
+        Ok(Box::new(Pending {
+            identity,
+            child: Some(child),
+            credential: Some((fs::File::from(credential_write), payload)),
+            reports: Some(fs::File::from(report_read)),
+            registration: Some(registration),
+            directory,
+            id: runner.id.clone(),
+            generation: runner.generation,
+            supervisor: self.supervisor.get().cloned().unwrap_or_default(),
+            running: Arc::clone(&self.running),
+            redactor: self.redactor.clone(),
+            interval: self.config.sweep_interval,
+        }))
+    }
 
-        let supervisor = self.supervisor.get().cloned().unwrap_or_default();
-        let (id, generation) = (runner.id.clone(), runner.generation);
-        let reported = Arc::new(Reported::default());
-        // The readers signal when their pipe ends, so the exit is reported after the last line
-        // and the last report (a claim must be known before the exit is classified).
-        let mut readers_done = Vec::new();
+    fn clock_now(&self) -> u64 {
+        sys::process_clock_now()
+    }
 
-        for stream in [
-            child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>),
-            child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let (supervisor, id) = (supervisor.clone(), id.clone());
-            let (done, finished) = std::sync::mpsc::channel::<()>();
-            readers_done.push(finished);
-            std::thread::spawn(move || {
-                let mut reader = BufReader::new(stream);
-                while let Ok(Some((line, cut))) = read_capped_line(&mut reader, MAX_OUTPUT_LINE_BYTES) {
-                    let mut line = String::from_utf8_lossy(&line).into_owned();
-                    if cut {
-                        line.push_str(" [line cut]");
-                    }
-                    if let Some(supervisor) = supervisor.upgrade() {
-                        supervisor.runner_output(&id, generation, &line);
-                    }
+    fn end_unrecorded(&self, runner: &RunnerRecord, since: u64) -> (usize, usize) {
+        let processes: Vec<ProcessIdentity> = sys::all_pids()
+            .into_iter()
+            .filter(|pid| *pid != std::process::id())
+            .filter_map(sys::process_info)
+            .filter(|p| !p.zombie && p.start_time_us >= since && Self::carries_marker(p.pid, runner))
+            .map(|p| p.identity())
+            .collect();
+        for process in &processes {
+            // Its own group leader since its launch: the group goes too. Identity checked just
+            // before, so a reused pid is never signalled.
+            if process.is_current() {
+                unsafe {
+                    libc::killpg(process.pid as libc::pid_t, libc::SIGKILL);
+                    libc::kill(process.pid as libc::pid_t, libc::SIGKILL);
                 }
-                let _ = done.send(());
-            });
+            }
         }
-        {
-            let (supervisor, id, reported) = (supervisor.clone(), id.clone(), Arc::clone(&reported));
-            let reports = fs::File::from(report_read);
-            let (done, finished) = std::sync::mpsc::channel::<()>();
-            readers_done.push(finished);
-            std::thread::spawn(move || {
-                read_reports(reports, &supervisor, &id, generation, pid, &reported);
-                let _ = done.send(());
-            });
-        }
-        let control = child.stdin.take();
-        self.running.lock().unwrap().insert(id.clone(), Running { generation, control });
-        {
-            let running = Arc::clone(&self.running);
-            let redactor = self.redactor.clone();
-            let (directory, interval) = (directory.clone(), self.config.sweep_interval);
-            std::thread::spawn(move || {
-                let status = child.wait();
-                // A process the runner started may keep a pipe open: wait a little, not forever.
-                for finished in readers_done {
-                    let _ = finished.recv_timeout(Duration::from_secs(2));
-                }
-                {
-                    let mut running = running.lock().unwrap();
-                    if running.get(&id).is_some_and(|r| r.generation == generation) {
-                        running.remove(&id);
-                    }
-                }
-                redactor.release(registration);
-                let claimed = reported.claimed.load(Ordering::SeqCst);
-                let finished = *reported.finished.lock().unwrap();
-                let exit = match &status {
-                    Ok(status) => classify_exit(status, claimed, finished),
-                    Err(error) => RunnerExit::Crashed(error.to_string()),
-                };
-                // Killed: what it started may still run (M3). Swept before its directory can be
-                // erased, reported after the exit.
-                let killed = matches!(&status, Ok(status) if status.signal().is_some());
-                let remaining = if killed { sweep::sweep(&[], &directory, interval) } else { 0 };
-                if let Some(supervisor) = supervisor.upgrade() {
-                    supervisor.runner_exited(&id, generation, exit);
-                    if remaining > 0 {
-                        supervisor.sweep_failed(&id, generation, remaining);
-                    }
-                }
-            });
-        }
-        Ok(identity)
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let remaining = loop {
+            let left = processes
+                .iter()
+                .filter(|p| {
+                    sys::process_info(p.pid).is_some_and(|now| now.start_time_us == p.start_time_us && !now.zombie)
+                })
+                .count();
+            if left == 0 || Instant::now() >= deadline {
+                break left;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        (processes.len() - remaining, remaining)
     }
 
     fn drain(&self, runner: &RunnerRecord) {
@@ -611,6 +580,135 @@ impl Launcher for ProcessLauncher {
     fn forget(&self, runner_id: &str) {
         if let Some(directory) = self.runner_dir(runner_id) {
             let _ = fs::remove_dir_all(directory);
+        }
+    }
+}
+
+/// A runner spawned and blocked on fd 3: it has not got its credential, so it can claim
+/// nothing (KCA-741). Nothing follows it yet: its output and reports wait in their pipes.
+struct Pending {
+    identity: ProcessIdentity,
+    child: Option<Child>,
+    credential: Option<(fs::File, Secret)>,
+    reports: Option<fs::File>,
+    registration: Option<Registration>,
+    directory: PathBuf,
+    id: String,
+    generation: u64,
+    supervisor: Weak<Supervisor>,
+    running: Arc<Mutex<BTreeMap<String, Running>>>,
+    redactor: Redactor,
+    interval: Duration,
+}
+
+impl PendingLaunch for Pending {
+    fn identity(&self) -> ProcessIdentity {
+        self.identity
+    }
+
+    fn release(mut self: Box<Self>) {
+        let mut child = self.child.take().expect("a pending launch has its process");
+        let registration = self.registration.take().expect("a pending launch has its registration");
+        let reports = self.reports.take();
+        // The credential goes through the pipe once, then the pipe is closed.
+        if let Some((mut writer, payload)) = self.credential.take() {
+            let _ = writer.write_all(payload.expose().as_bytes());
+        }
+        let (supervisor, directory, interval) = (self.supervisor.clone(), self.directory.clone(), self.interval);
+        let (id, generation, pid) = (self.id.clone(), self.generation, self.identity.pid);
+        let reported = Arc::new(Reported::default());
+        // The readers signal when their pipe ends, so the exit is reported after the last line
+        // and the last report (a claim must be known before the exit is classified).
+        let mut readers_done = Vec::new();
+
+        for stream in [
+            child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>),
+            child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let (supervisor, id) = (supervisor.clone(), id.clone());
+            let (done, finished) = std::sync::mpsc::channel::<()>();
+            readers_done.push(finished);
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream);
+                while let Ok(Some((line, cut))) = read_capped_line(&mut reader, MAX_OUTPUT_LINE_BYTES) {
+                    let mut line = String::from_utf8_lossy(&line).into_owned();
+                    if cut {
+                        line.push_str(" [line cut]");
+                    }
+                    if let Some(supervisor) = supervisor.upgrade() {
+                        supervisor.runner_output(&id, generation, &line);
+                    }
+                }
+                let _ = done.send(());
+            });
+        }
+        if let Some(reports) = reports {
+            let (supervisor, id, reported) = (supervisor.clone(), id.clone(), Arc::clone(&reported));
+            let (done, finished) = std::sync::mpsc::channel::<()>();
+            readers_done.push(finished);
+            std::thread::spawn(move || {
+                read_reports(reports, &supervisor, &id, generation, pid, &reported);
+                let _ = done.send(());
+            });
+        }
+        let control = child.stdin.take();
+        self.running.lock().unwrap().insert(id.clone(), Running { generation, control });
+        let running = Arc::clone(&self.running);
+        let redactor = self.redactor.clone();
+        std::thread::spawn(move || {
+            let status = child.wait();
+            // A process the runner started may keep a pipe open: wait a little, not forever.
+            for finished in readers_done {
+                let _ = finished.recv_timeout(Duration::from_secs(2));
+            }
+            {
+                let mut running = running.lock().unwrap();
+                if running.get(&id).is_some_and(|r| r.generation == generation) {
+                    running.remove(&id);
+                }
+            }
+            redactor.release(registration);
+            let claimed = reported.claimed.load(Ordering::SeqCst);
+            let finished = *reported.finished.lock().unwrap();
+            let exit = match &status {
+                Ok(status) => classify_exit(status, claimed, finished),
+                Err(error) => RunnerExit::Crashed(error.to_string()),
+            };
+            // Killed: what it started may still run (M3). Swept before its directory can be
+            // erased, reported after the exit.
+            let killed = matches!(&status, Ok(status) if status.signal().is_some());
+            let remaining = if killed { sweep::sweep(&[], &directory, interval) } else { 0 };
+            if let Some(supervisor) = supervisor.upgrade() {
+                supervisor.runner_exited(&id, generation, exit);
+                if remaining > 0 {
+                    supervisor.sweep_failed(&id, generation, remaining);
+                }
+            }
+        });
+    }
+
+    fn abort(self: Box<Self>) {
+        // Dropping does it.
+    }
+}
+
+impl Drop for Pending {
+    /// Not released: the process is killed with its group and collected, its credential is
+    /// never written (the pipe closes unwritten).
+    fn drop(&mut self) {
+        self.credential = None;
+        if let Some(mut child) = self.child.take() {
+            if self.identity.is_current() {
+                unsafe { libc::killpg(self.identity.pid as libc::pid_t, libc::SIGKILL) };
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(registration) = self.registration.take() {
+            self.redactor.release(registration);
         }
     }
 }

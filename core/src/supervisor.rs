@@ -39,10 +39,19 @@ pub struct LaunchTarget {
 /// Starts and stops runner processes. [`crate::process::ProcessLauncher`] runs real ones;
 /// [`crate::fake::FakeLauncher`] pretends, for the tests and the demo.
 pub trait Launcher: Send + Sync {
-    /// Launches the one-job process of `runner.generation` for `target`. The runner gets its
+    /// Spawns the one-job process of `runner.generation` for `target`, **without** its
+    /// credential: the process waits for it, so it can claim nothing until the supervisor has
+    /// saved its identity and calls [`PendingLaunch::release`] (KCA-741). The runner gets its
     /// credential from the launcher, never from the supervisor. `runner.scope` is what the
     /// supervisor planned; contract v1 does not pass it to the runner (KCA-734 §3).
-    fn spawn(&self, runner: &RunnerRecord, target: &LaunchTarget) -> Result<ProcessIdentity, String>;
+    fn spawn(&self, runner: &RunnerRecord, target: &LaunchTarget) -> Result<Box<dyn PendingLaunch>, String>;
+    /// Now, on the clock process start times are measured with: what
+    /// [`RunnerRecord::launching_since`] records.
+    fn clock_now(&self) -> u64;
+    /// Ends the processes of a launch that was never recorded: those carrying `runner.id` and
+    /// `runner.generation` that started at `since` or later. They never got their credential.
+    /// Returns how many were ended and how many still run.
+    fn end_unrecorded(&self, runner: &RunnerRecord, since: u64) -> (usize, usize);
     /// Asks the process to stop claiming and exit once its job, if any, is done. Never
     /// interrupts a job.
     fn drain(&self, runner: &RunnerRecord);
@@ -53,6 +62,17 @@ pub trait Launcher: Send + Sync {
     fn is_alive(&self, runner: &RunnerRecord) -> bool;
     /// Erases what the runner left locally (its state and work directories).
     fn forget(&self, runner_id: &str);
+}
+
+/// A process spawned and waiting for its credential (KCA-741). Dropped without
+/// [`PendingLaunch::release`], it is aborted.
+pub trait PendingLaunch: Send {
+    fn identity(&self) -> ProcessIdentity;
+    /// Hands the credential over, then starts following the process. Only once its identity
+    /// has been saved.
+    fn release(self: Box<Self>);
+    /// Kills the process, which never got its credential.
+    fn abort(self: Box<Self>);
 }
 
 #[derive(Debug, Clone)]
@@ -260,6 +280,10 @@ impl Supervisor {
         let ids: Vec<RunnerId> = inner.slots.keys().cloned().collect();
         for id in ids {
             let record = inner.slots[&id].record.clone();
+            if let Some(since) = record.launching_since {
+                // A launch the previous service did not finish recording (KCA-741).
+                self.clear_launch(&mut inner, &id, since);
+            }
             let Some(pid) = record.pid else { continue };
             if self.launcher.is_alive(&record) {
                 {
@@ -291,6 +315,43 @@ impl Supervisor {
         inner.reconciled = true;
         self.persist(&mut inner);
         self.refresh_admission(&mut inner);
+    }
+
+    /// Ends what a launch interrupted before its pid was saved left behind, so no second
+    /// process of this runner ever runs. What cannot be ended leaves the runner `failed` with
+    /// its launch intent kept: it is not launched again until a later start of the service
+    /// clears it.
+    fn clear_launch(&self, inner: &mut Inner, runner_id: &str, since: u64) {
+        let record = inner.slots[runner_id].record.clone();
+        let (ended, remaining) = self.launcher.end_unrecorded(&record, since);
+        if remaining > 0 {
+            self.fail(
+                inner,
+                runner_id,
+                &format!(
+                    "A launch interrupted by a stop of the service left {remaining} process(es) that could not be ended; restart the service to retry."
+                ),
+            );
+            return;
+        }
+        inner.slots.get_mut(runner_id).unwrap().record.launching_since = None;
+        let message = match ended {
+            0 => "A launch interrupted by a stop of the service left no process.".to_string(),
+            n => format!(
+                "Ended {n} process(es) of a launch interrupted by a stop of the service, before they got their credential."
+            ),
+        };
+        self.log(inner, runner_id, LogLevel::Warning, message);
+    }
+
+    /// Whether a launch the service could not clean up is still pending for this runner.
+    fn unresolved_launch(inner: &Inner, runner_id: &str) -> Result<(), ServiceError> {
+        match inner.slots.get(runner_id).is_some_and(|s| s.record.launching_since.is_some()) {
+            true => Err(ServiceError::Unavailable(
+                "A previous launch of this runner could not be cleaned up; restart the service.".into(),
+            )),
+            false => Ok(()),
+        }
     }
 
     // MARK: Regulation
@@ -814,6 +875,7 @@ impl Supervisor {
         if !matches!(slot.state, RunnerState::Stopped | RunnerState::Failed) || slot.discard {
             return Err(ServiceError::InvalidTransition { from: slot.state, action: "start".into() });
         }
+        Self::unresolved_launch(inner, runner_id)?;
         let live = Self::live_scopes(inner);
         let scope = inner.regulator.may_launch_one(&live, inner.last_queue.as_ref())?;
         let slot = inner.slots.get_mut(runner_id).unwrap();
@@ -857,6 +919,7 @@ impl Supervisor {
         if !matches!(slot.state, RunnerState::Stopped | RunnerState::Failed) {
             return Err(ServiceError::InvalidTransition { from: slot.state, action: "remove".into() });
         }
+        Self::unresolved_launch(&inner, runner_id)?;
         inner.slots.remove(runner_id);
         self.launcher.forget(runner_id);
         self.persist(&mut inner);
@@ -987,6 +1050,7 @@ impl Supervisor {
             generation: 0,
             pid: None,
             start_time_us: None,
+            launching_since: None,
             scope: None,
             created_at_ms: self.now(),
             manual,
@@ -1004,10 +1068,16 @@ impl Supervisor {
         id
     }
 
+    /// Launches the next generation of a runner so that a stop of the service at any point
+    /// never leaves a process it does not know about (KCA-741): 1. the launch intent is saved;
+    /// 2. the process is spawned and waits for its credential; 3. its pid and start time are
+    /// saved; 4. only then does it get its credential. If step 3 cannot be saved, the process is
+    /// killed before it got anything.
     fn launch(&self, inner: &mut Inner, runner_id: &str, scope: Option<ScopeId>) {
         let record = {
             let slot = inner.slots.get_mut(runner_id).unwrap();
             debug_assert!(!slot.state.is_live(), "never launch over a live runner");
+            debug_assert!(slot.record.launching_since.is_none(), "never launch over an unresolved launch");
             slot.record.generation += 1;
             slot.record.scope = scope;
             slot.restart_at_ms = None;
@@ -1018,30 +1088,58 @@ impl Supervisor {
         self.set_state(inner, runner_id, RunnerState::Starting);
         let target = match (&inner.stored.machine_id, &inner.stored.connection) {
             (Some(machine_id), Connection::Associated { instance, .. }) => {
-                Ok(LaunchTarget { machine_id: machine_id.clone(), instance: instance.clone() })
+                LaunchTarget { machine_id: machine_id.clone(), instance: instance.clone() }
             }
-            _ => Err("the machine is not associated".to_string()),
+            _ => return self.launch_failed(inner, runner_id, "could not start: the machine is not associated"),
         };
-        match target.and_then(|target| self.launcher.spawn(&record, &target)) {
-            Ok(identity) => {
-                {
-                    let slot = inner.slots.get_mut(runner_id).unwrap();
-                    slot.record.pid = Some(identity.pid);
-                    slot.record.start_time_us = Some(identity.start_time_us);
-                }
-                self.log(
-                    inner,
-                    runner_id,
-                    LogLevel::Info,
-                    format!("Launched for one task (generation {}).", record.generation),
-                );
-                self.persist(inner);
-            }
-            Err(reason) => {
-                inner.slots.get_mut(runner_id).unwrap().record.scope = None;
-                self.crashed(inner, runner_id, &format!("could not start: {reason}"));
-            }
+
+        inner.slots.get_mut(runner_id).unwrap().record.launching_since = Some(self.launcher.clock_now());
+        if let Err(error) = self.try_persist(inner) {
+            inner.slots.get_mut(runner_id).unwrap().record.launching_since = None;
+            return self.launch_failed(
+                inner,
+                runner_id,
+                &format!("could not start: the launch could not be saved ({error})"),
+            );
         }
+
+        let pending = match self.launcher.spawn(&record, &target) {
+            Ok(pending) => pending,
+            Err(reason) => {
+                // Nothing runs (the launcher never leaves a process behind a failed spawn).
+                inner.slots.get_mut(runner_id).unwrap().record.launching_since = None;
+                return self.launch_failed(inner, runner_id, &format!("could not start: {reason}"));
+            }
+        };
+        let identity = pending.identity();
+        {
+            let slot = inner.slots.get_mut(runner_id).unwrap();
+            slot.record.pid = Some(identity.pid);
+            slot.record.start_time_us = Some(identity.start_time_us);
+            slot.record.launching_since = None;
+        }
+        if let Err(error) = self.try_persist(inner) {
+            // Not recorded: a restart would not know it. It has no credential, so it is killed.
+            pending.abort();
+            inner.slots.get_mut(runner_id).unwrap().record.launching_since = None;
+            return self.launch_failed(
+                inner,
+                runner_id,
+                &format!("could not start: its process could not be saved ({error}), so it was stopped before getting its credential"),
+            );
+        }
+        pending.release();
+        self.log(
+            inner,
+            runner_id,
+            LogLevel::Info,
+            format!("Launched for one task (generation {}).", record.generation),
+        );
+    }
+
+    fn launch_failed(&self, inner: &mut Inner, runner_id: &str, reason: &str) {
+        inner.slots.get_mut(runner_id).unwrap().record.scope = None;
+        self.crashed(inner, runner_id, reason);
     }
 
     fn drain(&self, inner: &mut Inner, runner_id: &str) {

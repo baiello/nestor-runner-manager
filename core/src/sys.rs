@@ -49,6 +49,13 @@ pub fn process_start_time_us(pid: u32) -> Option<u64> {
     bsd_info(pid).map(|info| info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
 }
 
+/// Now, on the clock [`process_start_time_us`] measures with: a process started after this call
+/// has a start time at least this value.
+#[cfg(target_os = "macos")]
+pub fn process_clock_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64)
+}
+
 #[cfg(target_os = "macos")]
 pub fn parent_pid(pid: u32) -> Option<u32> {
     bsd_info(pid).map(|info| info.pbi_ppid)
@@ -260,6 +267,15 @@ pub fn process_start_time_us(pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let after = &stat[stat.rfind(')')? + 2..];
     after.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
+/// Now, in clock ticks after boot like [`process_start_time_us`] (rounded down).
+#[cfg(target_os = "linux")]
+pub fn process_clock_now() -> u64 {
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
+    let uptime = std::fs::read_to_string("/proc/uptime").unwrap_or_default();
+    let seconds: f64 = uptime.split_whitespace().next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    (seconds * ticks) as u64
 }
 
 #[cfg(target_os = "linux")]

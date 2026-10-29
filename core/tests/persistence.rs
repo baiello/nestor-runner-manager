@@ -285,3 +285,55 @@ fn a_setting_that_cannot_be_saved_is_never_acknowledged() {
     assert!(harness.supervisor.status().config_error.is_none());
     assert_eq!(store.load().state().mode, Mode::Paused);
 }
+
+#[test]
+fn nothing_is_spawned_when_the_launch_intent_cannot_be_saved() {
+    let store = Arc::new(FailingStore { inner: MemoryStore::default(), failing: false.into() });
+    let harness = Harness::with(store.clone(), Arc::new(FakeLauncher::new()), options());
+    harness.supervisor.reconcile();
+    harness.associate();
+    store.failing.store(true, std::sync::atomic::Ordering::SeqCst);
+    harness.supervisor.tick(&queue(1));
+    assert_eq!(harness.launcher.spawns(), 0, "no process without a saved intent (KCA-741)");
+    let runner = harness.supervisor.runners().remove(0);
+    assert_eq!(runner.state, RunnerState::Stopped);
+    assert!(harness
+        .supervisor
+        .logs(&runner.id, 10)
+        .unwrap()
+        .iter()
+        .any(|l| l.message.contains("launch could not be saved")));
+}
+
+#[test]
+fn a_launch_intent_left_by_a_stopped_service_ends_its_process_before_any_launch() {
+    let store: Arc<dyn Store> = Arc::new(MemoryStore::default());
+    let launcher = Arc::new(FakeLauncher::new());
+    let first = Harness::with(store.clone(), launcher.clone(), options());
+    first.supervisor.reconcile();
+    first.associate();
+    first.supervisor.tick(&queue(1));
+    let process = launcher.live().remove(0);
+    assert!(process.credential, "released once its pid was saved");
+    drop(first);
+
+    // As if the service had stopped between the spawn and the save of the pid: the state holds
+    // the intent and no pid, the process (that never got its credential) is still there.
+    let mut state = store.load().state().clone();
+    let record = &mut state.runners[0];
+    (record.pid, record.start_time_us, record.launching_since) = (None, None, Some(process.pid as u64 * 1_000));
+    store.save(&state).unwrap();
+
+    let second = Harness::with(store.clone(), launcher.clone(), options());
+    second.supervisor.tick(&queue(1));
+    assert_eq!(launcher.live_for(&process.runner_id).len(), 1, "nothing happens before reconcile");
+    second.supervisor.reconcile();
+    assert!(launcher.live_for(&process.runner_id).is_empty(), "ended by reconcile");
+    assert_eq!(store.load().state().runners[0].launching_since, None);
+    second.associate();
+    second.supervisor.tick(&queue(1));
+    let live = launcher.live_for(&process.runner_id);
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].generation, process.generation + 1);
+    assert_eq!(launcher.duplicate_launches(), 0);
+}

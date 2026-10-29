@@ -7,10 +7,10 @@
 //! launched: it refuses to launch anything.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::persist::RunnerRecord;
-use crate::supervisor::{LaunchTarget, Launcher};
+use crate::supervisor::{LaunchTarget, Launcher, PendingLaunch};
 use crate::sys::ProcessIdentity;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,11 +25,13 @@ pub struct FakeProcess {
     pub terminated: bool,
     /// Killed.
     pub killed: bool,
+    /// Got its credential: only once its identity was saved (KCA-741).
+    pub credential: bool,
 }
 
 #[derive(Default)]
 pub struct FakeLauncher {
-    state: Mutex<FakeState>,
+    state: Arc<Mutex<FakeState>>,
 }
 
 #[derive(Default)]
@@ -45,7 +47,7 @@ struct FakeState {
 
 impl FakeLauncher {
     pub fn new() -> Self {
-        FakeLauncher { state: Mutex::new(FakeState { next_pid: 10_000, ..FakeState::default() }) }
+        FakeLauncher { state: Arc::new(Mutex::new(FakeState { next_pid: 10_000, ..FakeState::default() })) }
     }
 
     pub fn live(&self) -> Vec<FakeProcess> {
@@ -99,7 +101,7 @@ impl FakeLauncher {
 }
 
 impl Launcher for FakeLauncher {
-    fn spawn(&self, runner: &RunnerRecord, _target: &LaunchTarget) -> Result<ProcessIdentity, String> {
+    fn spawn(&self, runner: &RunnerRecord, _target: &LaunchTarget) -> Result<Box<dyn PendingLaunch>, String> {
         let mut state = self.state.lock().unwrap();
         if state.fail_spawns {
             return Err("simulated launch failure".into());
@@ -120,9 +122,25 @@ impl Launcher for FakeLauncher {
                 drained: false,
                 terminated: false,
                 killed: false,
+                credential: false,
             },
         );
-        Ok(ProcessIdentity { pid, start_time_us: pid as u64 * 1_000 })
+        let identity = ProcessIdentity { pid, start_time_us: pid as u64 * 1_000 };
+        Ok(Box::new(FakePending { identity, state: Arc::clone(&self.state) }))
+    }
+
+    /// The start time the next pretend process will get.
+    fn clock_now(&self) -> u64 {
+        (self.state.lock().unwrap().next_pid as u64 + 1) * 1_000
+    }
+
+    fn end_unrecorded(&self, runner: &RunnerRecord, since: u64) -> (usize, usize) {
+        let mut state = self.state.lock().unwrap();
+        let before = state.live.len();
+        state.live.retain(|pid, p| {
+            !(p.runner_id == runner.id && p.generation == runner.generation && *pid as u64 * 1_000 >= since)
+        });
+        (before - state.live.len(), 0)
     }
 
     fn drain(&self, runner: &RunnerRecord) {
@@ -150,13 +168,51 @@ impl Launcher for FakeLauncher {
     }
 }
 
+/// A pretend process waiting for its credential: dropped without being released, it is killed.
+struct FakePending {
+    identity: ProcessIdentity,
+    state: Arc<Mutex<FakeState>>,
+}
+
+impl PendingLaunch for FakePending {
+    fn identity(&self) -> ProcessIdentity {
+        self.identity
+    }
+
+    fn release(self: Box<Self>) {
+        if let Some(process) = self.state.lock().unwrap().live.get_mut(&self.identity.pid) {
+            process.credential = true;
+        }
+    }
+
+    fn abort(self: Box<Self>) {}
+}
+
+impl Drop for FakePending {
+    fn drop(&mut self) {
+        let mut state = self.state.lock().unwrap();
+        if state.live.get(&self.identity.pid).is_some_and(|p| !p.credential) {
+            state.live.remove(&self.identity.pid);
+        }
+    }
+}
+
 /// The live service's launcher while no real runner can be launched (no association, or no
 /// runner binary configured): nothing is ever launched.
 pub struct UnavailableLauncher;
 
 impl Launcher for UnavailableLauncher {
-    fn spawn(&self, _runner: &RunnerRecord, _target: &LaunchTarget) -> Result<ProcessIdentity, String> {
+    fn spawn(&self, _runner: &RunnerRecord, _target: &LaunchTarget) -> Result<Box<dyn PendingLaunch>, String> {
         Err("no runner can be launched in this version".into())
+    }
+
+    fn clock_now(&self) -> u64 {
+        0
+    }
+
+    fn end_unrecorded(&self, _runner: &RunnerRecord, _since: u64) -> (usize, usize) {
+        // Nothing was ever launched; a matching process is not ours to signal.
+        (0, 0)
     }
 
     fn drain(&self, _runner: &RunnerRecord) {}
