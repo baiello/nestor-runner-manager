@@ -18,6 +18,13 @@ private actor GatedRunnerService: RunnerService {
     func machineInfo() async throws -> MachineInfo { try await demo.machineInfo() }
     func connection() async throws -> NestorConnection { try await demo.connection() }
     func associate() async throws -> NestorConnection { try await demo.associate() }
+    func machineStatus() async throws -> MachineStatus { try await demo.machineStatus() }
+    func setMode(_ mode: AdmissionMode, expectedRevision: Int) async throws -> MachineStatus {
+        try await demo.setMode(mode, expectedRevision: expectedRevision)
+    }
+    func setMaxConcurrentTasks(_ value: Int, expectedRevision: Int) async throws -> MachineStatus {
+        try await demo.setMaxConcurrentTasks(value, expectedRevision: expectedRevision)
+    }
     func runners() async throws -> [Runner] { try await demo.runners() }
     func addRunner(_ request: NewRunnerRequest) async throws -> Runner {
         if !released {
@@ -26,7 +33,7 @@ private actor GatedRunnerService: RunnerService {
         return try await demo.addRunner(request)
     }
     func start(runnerID: Runner.ID) async throws -> Runner { try await demo.start(runnerID: runnerID) }
-    func stop(runnerID: Runner.ID) async throws -> Runner { try await demo.stop(runnerID: runnerID) }
+    func stop(runnerID: Runner.ID, force: Bool) async throws -> Runner { try await demo.stop(runnerID: runnerID, force: force) }
     func remove(runnerID: Runner.ID) async throws { try await demo.remove(runnerID: runnerID) }
     func logs(runnerID: Runner.ID, limit: Int) async throws -> [LogEntry] { try await demo.logs(runnerID: runnerID, limit: limit) }
 }
@@ -62,10 +69,10 @@ private actor GatedRunnerService: RunnerService {
         let model = RunnerManagerModel(service: DemoRunnerService(latency: .zero))
         await model.load()
         let form = AddRunnerForm()
-        form.name = "studio-build"
+        form.name = "runner-1"
 
         #expect(await form.submit(to: model) == nil)
-        #expect(form.error == "A runner named “studio-build” already exists on this machine.")
+        #expect(form.error == "A runner named “runner-1” already exists on this machine.")
         #expect(form.canDismiss)
         #expect(form.canSubmit)
         #expect(model.runners.value?.count == 3)

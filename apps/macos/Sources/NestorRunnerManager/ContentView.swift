@@ -3,6 +3,8 @@ import SwiftUI
 
 enum SidebarItem: Hashable {
     case overview
+    /// The runners, as a diagnostic: the service manages them.
+    case diagnostics
     case runner(Runner.ID)
 }
 
@@ -15,7 +17,7 @@ struct ContentView: View {
         VStack(spacing: 0) {
             if model.isDemo { DemoBanner() }
             NavigationSplitView {
-                Sidebar(model: model, selection: $selection, isAddingRunner: $isAddingRunner)
+                Sidebar(model: model, selection: $selection)
                     .navigationSplitViewColumnWidth(min: 220, ideal: 240)
             } detail: {
                 detail
@@ -28,16 +30,7 @@ struct ContentView: View {
                 } label: {
                     Label("Refresh", systemImage: "arrow.clockwise")
                 }
-                .help("Reload the machine, the Nestor connection and the runners")
-            }
-            ToolbarItem {
-                Button {
-                    isAddingRunner = true
-                } label: {
-                    Label("Add Runner", systemImage: "plus")
-                }
-                .disabled(!model.isAssociated)
-                .help(model.isAssociated ? "Add a runner on this machine" : "Associate this machine with Nestor first")
+                .help("Reload the machine, its tasks and the Nestor connection")
             }
         }
         .sheet(isPresented: $isAddingRunner) {
@@ -54,11 +47,18 @@ struct ContentView: View {
         } message: { message in
             Text(message)
         }
-        .task { await model.load() }
+        .task {
+            await model.load()
+            // Tasks start and end on their own: keep the status current.
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(3))
+                await model.refresh()
+            }
+        }
         .onChange(of: model.runners) {
             // Leave a runner's page once it has been removed.
             if case .runner(let id) = selection, model.runners.value != nil, model.runner(id) == nil {
-                selection = .overview
+                selection = .diagnostics
             }
         }
     }
@@ -71,8 +71,10 @@ struct ContentView: View {
             } else {
                 ContentUnavailableView("No runner selected", systemImage: "server.rack")
             }
+        case .diagnostics:
+            DiagnosticsView(model: model, selection: $selection, isAddingRunner: $isAddingRunner)
         case .overview, nil:
-            OverviewView(model: model, isAddingRunner: $isAddingRunner)
+            OverviewView(model: model, selection: $selection)
         }
     }
 }
@@ -80,14 +82,15 @@ struct ContentView: View {
 struct Sidebar: View {
     var model: RunnerManagerModel
     @Binding var selection: SidebarItem?
-    @Binding var isAddingRunner: Bool
 
     var body: some View {
         List(selection: $selection) {
             Label("This Mac", systemImage: "desktopcomputer")
                 .tag(SidebarItem.overview)
 
-            Section("Runners") {
+            Section("Diagnostics") {
+                Label("Runners", systemImage: "stethoscope")
+                    .tag(SidebarItem.diagnostics)
                 switch model.runners {
                 case .loading:
                     HStack(spacing: 8) {
@@ -98,11 +101,12 @@ struct Sidebar: View {
                     Label("Unavailable", systemImage: "exclamationmark.triangle")
                         .foregroundStyle(.secondary)
                 case .loaded(let runners) where runners.isEmpty:
-                    Text("No runner yet").foregroundStyle(.secondary)
+                    EmptyView()
                 case .loaded(let runners):
                     ForEach(runners) { runner in
                         HStack {
                             Label(runner.name, systemImage: "server.rack")
+                                .padding(.leading, 8)
                             Spacer()
                             StateDot(state: runner.state)
                         }

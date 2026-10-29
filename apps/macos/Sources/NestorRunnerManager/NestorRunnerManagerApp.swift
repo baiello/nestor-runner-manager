@@ -8,7 +8,11 @@ enum Entry {
         let options = LaunchOptions(arguments: CommandLine.arguments)
         if let directory = options.snapshotDirectory {
             MainActor.assumeIsolated {
-                Snapshots.render(to: directory)
+                if let socket = options.socketPath {
+                    Snapshots.renderService(at: socket, prefix: options.snapshotPrefix, to: directory)
+                } else {
+                    Snapshots.render(to: directory)
+                }
             }
             return
         }
@@ -16,10 +20,14 @@ enum Entry {
     }
 }
 
-/// Command-line options, mostly to show the demo's other states.
+/// Command-line options: the demo's other states, or the local service.
 struct LaunchOptions {
     var scenario: DemoRunnerService.Scenario = .populated
     var snapshotDirectory: URL?
+    var snapshotPrefix = "service"
+    /// Set by `--service` (default socket) or `--socket <path>`: use the local service of `core/`
+    /// instead of the in-app demo.
+    var socketPath: String?
 
     init(arguments: [String]) {
         var iterator = arguments.dropFirst().makeIterator()
@@ -33,6 +41,12 @@ struct LaunchOptions {
                 if let value = iterator.next() {
                     snapshotDirectory = URL(fileURLWithPath: value, isDirectory: true)
                 }
+            case "--snapshot-prefix":
+                if let value = iterator.next() { snapshotPrefix = value }
+            case "--service":
+                socketPath = socketPath ?? LiveRunnerService.defaultSocketPath
+            case "--socket":
+                if let value = iterator.next() { socketPath = value }
             default:
                 break
             }
@@ -46,8 +60,14 @@ struct NestorRunnerManagerApp: App {
 
     init() {
         let options = LaunchOptions(arguments: CommandLine.arguments)
-        // The only service available today. Replace with the live service once the Rust core exists.
-        _model = State(initialValue: RunnerManagerModel(service: DemoRunnerService(scenario: options.scenario)))
+        // The in-app demo by default; `--service` or `--socket` reach the local service, whose own
+        // report decides whether the demo banner shows.
+        let service: any RunnerService = if let socket = options.socketPath {
+            LiveRunnerService(socketPath: socket)
+        } else {
+            DemoRunnerService(scenario: options.scenario)
+        }
+        _model = State(initialValue: RunnerManagerModel(service: service))
     }
 
     var body: some Scene {

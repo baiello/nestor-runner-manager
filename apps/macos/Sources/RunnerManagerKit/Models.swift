@@ -37,10 +37,15 @@ public enum NestorConnection: Equatable, Sendable {
     case notAssociated
     case associated(instance: String, since: Date)
     case unreachable(instance: String, reason: String)
+    /// The association was revoked in Nestor; associate again to take tasks.
+    case revoked
 }
 
+/// A runner's lifecycle. The service starts and stops runners itself; a runner takes one task at
+/// a time and is `busy` while it does.
 public enum RunnerState: String, Equatable, Sendable, CaseIterable {
-    case running
+    case busy
+    case ready
     case starting
     case stopping
     case stopped
@@ -48,8 +53,9 @@ public enum RunnerState: String, Equatable, Sendable, CaseIterable {
 
     /// Whether `start` makes sense from this state.
     public var canStart: Bool { self == .stopped || self == .failed }
-    /// Whether `stop` makes sense from this state.
-    public var canStop: Bool { self == .running || self == .starting }
+    /// Whether `stop` makes sense from this state. Stopping a busy runner ends its task, so the
+    /// interface asks for a confirmation first.
+    public var canStop: Bool { self == .ready || self == .starting || self == .busy }
     /// A runner must be stopped before it is removed.
     public var canRemove: Bool { self == .stopped || self == .failed }
 }
@@ -83,6 +89,8 @@ public struct Runner: Identifiable, Equatable, Sendable {
     public var usage: ResourceUsage
     public var createdAt: Date
     public var lastJobAt: Date?
+    /// Nestor's reference of the task the runner is running, if any.
+    public var currentTaskRef: String?
 
     public init(
         id: UUID = UUID(),
@@ -91,7 +99,8 @@ public struct Runner: Identifiable, Equatable, Sendable {
         failureReason: String? = nil,
         usage: ResourceUsage = .idle,
         createdAt: Date,
-        lastJobAt: Date? = nil
+        lastJobAt: Date? = nil,
+        currentTaskRef: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -100,6 +109,7 @@ public struct Runner: Identifiable, Equatable, Sendable {
         self.usage = usage
         self.createdAt = createdAt
         self.lastJobAt = lastJobAt
+        self.currentTaskRef = currentTaskRef
     }
 }
 
@@ -130,5 +140,124 @@ public struct LogEntry: Identifiable, Equatable, Sendable {
         self.date = date
         self.level = level
         self.message = message
+    }
+}
+
+// MARK: Machine status
+
+/// The user's choice: take tasks automatically, or pause new admissions. A pause never stops a
+/// task that is already running.
+public enum AdmissionMode: String, Equatable, Sendable, CaseIterable {
+    case automatic
+    case paused
+}
+
+/// Why no task can be admitted besides a pause.
+public enum AdmissionBlock: String, Equatable, Sendable {
+    case notAssociated
+    case unreachable
+    case revoked
+    /// The service has just started and is still checking the runners it left running.
+    case reconciling
+}
+
+/// Whether the service accepts new tasks right now.
+public enum AdmissionState: Equatable, Sendable {
+    case open
+    case paused
+    case blocked(AdmissionBlock)
+}
+
+public enum MemoryPressure: String, Equatable, Sendable {
+    case normal, warning, critical
+}
+
+/// One sample of the machine's load. Measurements, never limits.
+public struct MachineLoad: Equatable, Sendable {
+    public var sampledAt: Date
+    public var cpuPercent: Double
+    public var memoryUsedBytes: UInt64
+    public var memoryTotalBytes: UInt64
+    public var memoryPressure: MemoryPressure?
+    public var diskFreeBytes: UInt64
+
+    public init(
+        sampledAt: Date,
+        cpuPercent: Double,
+        memoryUsedBytes: UInt64,
+        memoryTotalBytes: UInt64,
+        memoryPressure: MemoryPressure?,
+        diskFreeBytes: UInt64
+    ) {
+        self.sampledAt = sampledAt
+        self.cpuPercent = cpuPercent
+        self.memoryUsedBytes = memoryUsedBytes
+        self.memoryTotalBytes = memoryTotalBytes
+        self.memoryPressure = memoryPressure
+        self.diskFreeBytes = diskFreeBytes
+    }
+}
+
+/// A task running on this machine. `taskRef` is Nestor's opaque reference; no task content is
+/// kept locally.
+public struct ActiveTask: Identifiable, Equatable, Sendable {
+    public var id: String { taskRef }
+    public var runnerID: Runner.ID
+    public var runnerName: String
+    public var taskRef: String
+    public var startedAt: Date
+
+    public init(runnerID: Runner.ID, runnerName: String, taskRef: String, startedAt: Date) {
+        self.runnerID = runnerID
+        self.runnerName = runnerName
+        self.taskRef = taskRef
+        self.startedAt = startedAt
+    }
+}
+
+/// The machine as the service runs it: admission settings, load and active tasks.
+///
+/// `maxConcurrentTasks` regulates how many tasks are admitted at the same time. It is not a
+/// processor or memory limit: no runner has one.
+public struct MachineStatus: Equatable, Sendable {
+    /// Reported by the service on every status. The interface shows the demo banner unless this
+    /// is `.live`.
+    public var serviceMode: ServiceMode
+    public var mode: AdmissionMode
+    public var admission: AdmissionState
+    public var maxConcurrentTasks: Int
+    /// Highest value accepted for `maxConcurrentTasks` (a sanity check on the input).
+    public var maxConcurrentTasksUpperBound: Int
+    /// Increases with every settings change; sent back with a change so two windows cannot
+    /// overwrite each other silently.
+    public var configRevision: Int
+    public var busyRunners: Int
+    public var activeTasks: [ActiveTask]
+    public var load: MachineLoad?
+    /// Set when the service could not read its stored settings and started paused instead.
+    public var configError: String?
+
+    public init(
+        serviceMode: ServiceMode,
+        mode: AdmissionMode,
+        admission: AdmissionState,
+        maxConcurrentTasks: Int,
+        maxConcurrentTasksUpperBound: Int,
+        configRevision: Int,
+        busyRunners: Int,
+        activeTasks: [ActiveTask],
+        load: MachineLoad?,
+        configError: String? = nil
+    ) {
+        self.serviceMode = serviceMode
+        self.mode = mode
+        self.admission = admission
+        self.maxConcurrentTasks = maxConcurrentTasks
+        self.maxConcurrentTasksUpperBound = maxConcurrentTasksUpperBound
+        self.configRevision = configRevision
+        self.busyRunners = busyRunners
+        self.activeTasks = activeTasks
+        self.load = load
+        self.configError = configError
     }
 }

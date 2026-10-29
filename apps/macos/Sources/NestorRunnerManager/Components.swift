@@ -4,7 +4,8 @@ import SwiftUI
 extension RunnerState {
     var title: String {
         switch self {
-        case .running: "Running"
+        case .busy: "Busy"
+        case .ready: "Ready"
         case .starting: "Starting"
         case .stopping: "Stopping"
         case .stopped: "Stopped"
@@ -14,7 +15,8 @@ extension RunnerState {
 
     var color: Color {
         switch self {
-        case .running: .green
+        case .busy: .green
+        case .ready: .blue
         case .starting, .stopping: .orange
         case .stopped: .secondary
         case .failed: .red
@@ -23,7 +25,8 @@ extension RunnerState {
 
     var symbol: String {
         switch self {
-        case .running: "play.circle.fill"
+        case .busy: "gearshape.2.fill"
+        case .ready: "checkmark.circle.fill"
         case .starting, .stopping: "clock.fill"
         case .stopped: "stop.circle.fill"
         case .failed: "exclamationmark.octagon.fill"
