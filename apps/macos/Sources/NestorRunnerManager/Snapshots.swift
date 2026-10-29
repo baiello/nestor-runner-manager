@@ -42,7 +42,6 @@ enum Snapshots {
         form.name = "studio-ci"
         form.limitsMemory = true
         form.memoryGiB = 32
-        form.concurrentJobs = 2
         return form
     }
 

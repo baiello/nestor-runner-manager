@@ -55,15 +55,16 @@ public enum RunnerState: String, Equatable, Sendable, CaseIterable {
 }
 
 /// Resource limits a runner is configured with. `nil` means no limit.
+///
+/// There is no setting for the number of jobs: the Nestor runner takes no new job while one is
+/// running. To run jobs in parallel, a machine runs several runners. A job may use several cores.
 public struct ResourceLimits: Equatable, Sendable {
     public var cpuCores: Int?
     public var memoryBytes: UInt64?
-    public var concurrentJobs: Int
 
-    public init(cpuCores: Int? = nil, memoryBytes: UInt64? = nil, concurrentJobs: Int = 1) {
+    public init(cpuCores: Int? = nil, memoryBytes: UInt64? = nil) {
         self.cpuCores = cpuCores
         self.memoryBytes = memoryBytes
-        self.concurrentJobs = concurrentJobs
     }
 }
 
@@ -71,12 +72,13 @@ public struct ResourceLimits: Equatable, Sendable {
 public struct ResourceUsage: Equatable, Sendable {
     public var cpuPercent: Double
     public var memoryBytes: UInt64
-    public var activeJobs: Int
+    /// Whether the runner is running its job; it never runs more than one.
+    public var isRunningJob: Bool
 
-    public init(cpuPercent: Double = 0, memoryBytes: UInt64 = 0, activeJobs: Int = 0) {
+    public init(cpuPercent: Double = 0, memoryBytes: UInt64 = 0, isRunningJob: Bool = false) {
         self.cpuPercent = cpuPercent
         self.memoryBytes = memoryBytes
-        self.activeJobs = activeJobs
+        self.isRunningJob = isRunningJob
     }
 
     public static let idle = ResourceUsage()

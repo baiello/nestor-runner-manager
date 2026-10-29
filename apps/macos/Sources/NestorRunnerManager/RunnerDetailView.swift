@@ -88,7 +88,7 @@ struct RunnerDetailView: View {
                 GridRow {
                     Text("").gridColumnAlignment(.leading)
                     Text("In use").foregroundStyle(.secondary)
-                    Text("Limit").foregroundStyle(.secondary)
+                    Text(model.isDemo ? "Limit (not enforced)" : "Limit").foregroundStyle(.secondary)
                 }
                 Divider()
                 GridRow {
@@ -101,12 +101,13 @@ struct RunnerDetailView: View {
                     Text(Format.bytes(runner.usage.memoryBytes))
                     Text(runner.limits.memoryBytes.map(Format.bytes) ?? "No limit")
                 }
-                GridRow {
-                    Text("Jobs")
-                    Text("\(runner.usage.activeJobs)")
-                    Text("\(runner.limits.concurrentJobs) at a time")
-                }
             }
+            Divider()
+            InfoRow(label: "Job", value: runner.usage.isRunningJob ? "Running a job" : "Idle")
+            InfoRow(label: "Capacity", value: "One job at a time")
+            Text("To run jobs in parallel, add more runners. Their isolation from each other is not guaranteed.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
             if let lastJob = runner.lastJobAt {
                 Text("Last job \(Format.relative(lastJob))")
                     .font(.callout)

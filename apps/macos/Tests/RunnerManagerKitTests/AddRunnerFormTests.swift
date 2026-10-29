@@ -76,11 +76,10 @@ private actor GatedRunnerService: RunnerService {
         form.name = "ci"
         form.limitsMemory = true
         form.memoryGiB = 32
-        form.concurrentJobs = 2
         form.startNow = false
         #expect(form.request == NewRunnerRequest(
             name: "ci",
-            limits: ResourceLimits(cpuCores: nil, memoryBytes: 32 << 30, concurrentJobs: 2),
+            limits: ResourceLimits(cpuCores: nil, memoryBytes: 32 << 30),
             startNow: false
         ))
     }

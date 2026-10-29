@@ -37,7 +37,7 @@ import Testing
 
     @Test func addedRunnerKeepsItsLimitsAndCanStayStopped() async throws {
         let demo = service(.empty)
-        let limits = ResourceLimits(cpuCores: 2, memoryBytes: 8 << 30, concurrentJobs: 3)
+        let limits = ResourceLimits(cpuCores: 2, memoryBytes: 8 << 30)
         let runner = try await demo.addRunner(NewRunnerRequest(name: "  ci  ", limits: limits, startNow: false))
         #expect(runner.name == "ci")
         #expect(runner.limits == limits)
@@ -77,6 +77,14 @@ import Testing
         await #expect(throws: RunnerServiceError.runnerNotFound) {
             try await demo.logs(runnerID: runner.id, limit: 10)
         }
+    }
+
+    @Test func onlyARunningRunnerIsRunningAJob() async throws {
+        let demo = service()
+        let runners = try await demo.runners()
+        #expect(runners.filter(\.usage.isRunningJob).map(\.state) == [.running])
+        let busy = try #require(runners.first { $0.usage.isRunningJob })
+        #expect(try await demo.stop(runnerID: busy.id).usage.isRunningJob == false)
     }
 
     @Test func startingAFailedRunnerClearsItsFailure() async throws {

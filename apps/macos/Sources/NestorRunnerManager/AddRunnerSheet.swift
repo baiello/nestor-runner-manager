@@ -22,7 +22,7 @@ struct AddRunnerSheet: View {
                     Text("Shown in Nestor, where you assign workspaces to this runner.")
                         .foregroundStyle(.secondary)
                 }
-                Section("Resources") {
+                Section {
                     Toggle("Limit processor", isOn: $form.limitsCPU)
                     if form.limitsCPU {
                         Stepper("\(form.cpuCores) cores", value: $form.cpuCores, in: 1...64)
@@ -31,7 +31,16 @@ struct AddRunnerSheet: View {
                     if form.limitsMemory {
                         Stepper("\(form.memoryGiB) GB", value: $form.memoryGiB, in: 1...512)
                     }
-                    Stepper("\(form.concurrentJobs) job\(form.concurrentJobs == 1 ? "" : "s") at a time", value: $form.concurrentJobs, in: 1...16)
+                } header: {
+                    Text("Resources")
+                } footer: {
+                    VStack(alignment: .trailing, spacing: 4) {
+                        Text("A runner takes one job at a time; a job may use several cores. To run jobs in parallel, add more runners — their isolation from each other is not guaranteed.")
+                        if model.isDemo {
+                            Text("Demo: limits are recorded, not enforced.")
+                        }
+                    }
+                    .foregroundStyle(.secondary)
                 }
                 Section {
                     Toggle("Start the runner now", isOn: $form.startNow)

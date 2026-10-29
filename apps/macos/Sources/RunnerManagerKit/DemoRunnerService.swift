@@ -171,15 +171,15 @@ public actor DemoRunnerService: RunnerService {
         let build = Runner(
             name: "studio-build",
             state: .running,
-            limits: ResourceLimits(cpuCores: 12, memoryBytes: 64 * gib, concurrentJobs: 2),
-            usage: ResourceUsage(cpuPercent: 37.5, memoryBytes: 18 * gib, activeJobs: 1),
+            limits: ResourceLimits(cpuCores: 12, memoryBytes: 64 * gib),
+            usage: ResourceUsage(cpuPercent: 37.5, memoryBytes: 18 * gib, isRunningJob: true),
             createdAt: ago(86_400 * 3),
             lastJobAt: ago(120)
         )
         let agents = Runner(
             name: "studio-agents",
             state: .stopped,
-            limits: ResourceLimits(cpuCores: 8, memoryBytes: 32 * gib, concurrentJobs: 1),
+            limits: ResourceLimits(cpuCores: 8, memoryBytes: 32 * gib),
             createdAt: ago(86_400 * 2),
             lastJobAt: ago(7_200)
         )
@@ -187,7 +187,7 @@ public actor DemoRunnerService: RunnerService {
             name: "studio-gpu",
             state: .failed,
             failureReason: "Simulated failure: the runner exited with status 1.",
-            limits: ResourceLimits(memoryBytes: 48 * gib, concurrentJobs: 1),
+            limits: ResourceLimits(memoryBytes: 48 * gib),
             createdAt: ago(86_400),
             lastJobAt: ago(5_400)
         )

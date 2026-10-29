@@ -14,7 +14,6 @@ public final class AddRunnerForm {
     public var cpuCores = 4
     public var limitsMemory = false
     public var memoryGiB = 16
-    public var concurrentJobs = 1
     public var startNow = true
 
     public private(set) var isSubmitting = false
@@ -48,8 +47,7 @@ public final class AddRunnerForm {
             name: name,
             limits: ResourceLimits(
                 cpuCores: limitsCPU ? cpuCores : nil,
-                memoryBytes: limitsMemory ? UInt64(memoryGiB) << 30 : nil,
-                concurrentJobs: concurrentJobs
+                memoryBytes: limitsMemory ? UInt64(memoryGiB) << 30 : nil
             ),
             startNow: startNow
         )

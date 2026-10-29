@@ -10,8 +10,10 @@ A desktop application to add, start, stop, remove and diagnose the Nestor runner
 
 - **This Mac**: the machine, its association with Nestor and a summary of its runners.
 - **Runners**: the list in the sidebar, with each runner's state.
-- **A runner's page**: state, resources in use against their limits, start / stop / remove actions and the logs.
-- **Add a runner**: a name, optional processor and memory limits, jobs at a time, and whether to start it now.
+- **A runner's page**: state, resources in use against their limits, whether it is running a job, start / stop / remove actions and the logs.
+- **Add a runner**: a name, optional processor and memory limits, and whether to start it now.
+
+A runner takes **one job at a time**, as the existing Nestor runner does; a job may use several processor cores. To run jobs in parallel, add more runners — their isolation from each other is not guaranteed. In the demo, the processor and memory limits are recorded but not enforced.
 - Loading, empty, not-associated and error states.
 
 Workspaces are not assigned here: on the Nestor web app, a workspace is assigned to a runner or a pool of runners. The interface never asks for a password or a token; in the real version, the association is confirmed in the browser and Nestor issues each runner its own credential.
