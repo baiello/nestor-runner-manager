@@ -69,7 +69,7 @@ With the local service (see [core/README.md](core/README.md)):
 ```sh
 (cd ../../core && cargo run --bin nestor-runner-service)            # live, in another terminal
 swift run NestorRunnerManager --service                             # an unsigned build gets read-only access
-(cd ../../core && cargo run --bin nestor-runner-service -- --simulate --allow-unsigned-clients)
+(cd ../../core && cargo run --features dev-unsigned --bin nestor-runner-service -- --simulate --allow-unsigned-clients)
 swift run NestorRunnerManager --socket "$HOME/Library/Application Support/Nestor Runner Manager/demo/run/service.sock"
 ```
 

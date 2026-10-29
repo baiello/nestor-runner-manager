@@ -433,3 +433,79 @@ fn runner_output_is_masked_at_the_source() {
     );
     assert!(text.contains("[masked]"));
 }
+
+#[test]
+fn without_the_server_scope_filter_one_task_runs_at_a_time() {
+    let harness = Harness::new();
+    harness.supervisor.reconcile();
+    harness.associate_without_scope_filter();
+    harness.supervisor.set_max_concurrent_tasks(4, None).unwrap();
+    let status = harness.supervisor.status();
+    assert_eq!(status.max_concurrent_tasks, 4, "the requested value is kept and shown");
+    assert_eq!(status.effective_max_concurrent_tasks, 1);
+    assert!(status.capped_by_server);
+    assert_eq!(harness.round(&queue(4)).len(), 1);
+    harness.round(&queue(4));
+    assert_eq!(harness.supervisor.status().live_runners, 1, "never more than one (KCA-734 §3)");
+
+    // Nestor announces its scope filter (S6): the requested ceiling applies.
+    harness.supervisor.set_scope_filter(true);
+    let status = harness.supervisor.status();
+    assert_eq!((status.effective_max_concurrent_tasks, status.capped_by_server), (4, false));
+    harness.round(&queue(4));
+    assert_eq!(harness.busy(), 4);
+
+    // It stops announcing it: nothing running is interrupted, nothing new starts until one remains.
+    harness.supervisor.set_scope_filter(false);
+    assert_eq!(harness.busy(), 4);
+    let busy: Vec<String> =
+        harness.supervisor.runners().into_iter().filter(|r| r.task_ref.is_some()).map(|r| r.id).collect();
+    harness.finish(&busy[0]);
+    harness.round(&queue(4));
+    assert_eq!(harness.supervisor.status().live_runners, 3, "no launch while above the ceiling");
+}
+
+#[test]
+fn a_refused_credential_blocks_launches_until_the_connection_changes() {
+    let harness = Harness::associated();
+    harness.round(&queue(1));
+    let runner = harness.supervisor.runners().remove(0);
+    let process = harness.launcher.live_for(&runner.id).remove(0);
+    harness.launcher.end(process.pid);
+    harness.supervisor.runner_exited(&runner.id, process.generation, RunnerExit::Revoked);
+    let view = harness.supervisor.runner(&runner.id).unwrap();
+    assert_eq!(view.state, RunnerState::Failed);
+    assert_eq!(harness.supervisor.status().admission, Admission::Blocked(BlockReason::Revoked));
+    let spawns = harness.launcher.spawns();
+    harness.advance(600_000);
+    harness.supervisor.tick(&queue(3));
+    assert_eq!(harness.launcher.spawns(), spawns, "no launch, no new runner");
+
+    // The association answers again (or ends and starts over): launches resume.
+    harness.supervisor.set_connection(Connection::Unreachable { instance: "test.invalid".into(), reason: "x".into() });
+    harness.associate();
+    assert_eq!(harness.supervisor.status().admission, Admission::Open);
+}
+
+#[test]
+fn unreachable_backs_off_without_counting_as_a_crash_and_usage_is_final() {
+    let harness = Harness::associated();
+    harness.supervisor.tick(&queue(1));
+    let runner = harness.supervisor.runners().remove(0);
+    for _ in 0..10 {
+        let process = harness.launcher.live_for(&runner.id).remove(0);
+        harness.launcher.end(process.pid);
+        harness.supervisor.runner_exited(&runner.id, process.generation, RunnerExit::Unreachable);
+        assert_eq!(harness.supervisor.runner(&runner.id).unwrap().state, RunnerState::Stopped, "never failed");
+        harness.advance(600_000);
+        harness.supervisor.tick(&queue(1));
+    }
+    let process = harness.launcher.live_for(&runner.id).remove(0);
+    harness.launcher.end(process.pid);
+    harness.supervisor.runner_exited(&runner.id, process.generation, RunnerExit::Usage);
+    assert_eq!(harness.supervisor.runner(&runner.id).unwrap().state, RunnerState::Failed);
+    let spawns = harness.launcher.spawns();
+    harness.advance(600_000);
+    harness.supervisor.tick(&queue(1));
+    assert_eq!(harness.launcher.spawns(), spawns);
+}

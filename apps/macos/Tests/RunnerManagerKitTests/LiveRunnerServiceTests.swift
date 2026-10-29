@@ -19,6 +19,25 @@ import Testing
         #expect(status.load?.memoryTotalBytes == 38_654_705_664)
     }
 
+    @Test func decodesTheCeilingCappedByTheServer() throws {
+        let reply = data("""
+        {"ok":true,"result":{"activeTasks":[],"admission":{"state":"open"},"busyRunners":0,"cappedByServer":true,"configError":null,"configRevision":2,"connection":{"state":"associated","instance":"nestor.example","sinceMs":5000},"effectiveMaxConcurrentTasks":1,"load":null,"maxConcurrentTasks":3,"maxConcurrentTasksUpperBound":8,"mode":"automatic","serviceMode":"live"}}
+        """)
+        let status = try LiveRunnerService.decode(reply, as: Wire.Status.self).model
+        #expect(status.maxConcurrentTasks == 3, "the requested value is kept")
+        #expect(status.effectiveMaxConcurrentTasks == 1)
+        #expect(status.cappedByServer)
+    }
+
+    @Test func anOlderServiceWithoutTheEffectiveCeilingIsNotCapped() throws {
+        let reply = data("""
+        {"ok":true,"result":{"activeTasks":[],"admission":{"state":"open"},"busyRunners":0,"configError":null,"configRevision":2,"connection":{"state":"notAssociated"},"load":null,"maxConcurrentTasks":2,"maxConcurrentTasksUpperBound":8,"mode":"automatic","serviceMode":"live"}}
+        """)
+        let status = try LiveRunnerService.decode(reply, as: Wire.Status.self).model
+        #expect(status.effectiveMaxConcurrentTasks == 2)
+        #expect(!status.cappedByServer)
+    }
+
     @Test func anythingButLiveIsADemo() throws {
         let reply = data("""
         {"ok":true,"result":{"activeTasks":[{"runnerId":"0123456789abcdef0123456789abcdef","runnerName":"runner-1","taskRef":"demo-task-3","startedAtMs":1000}],"admission":{"state":"paused"},"busyRunners":1,"configError":"unreadable state file","configRevision":4,"connection":{"state":"associated","instance":"demo.nestor.invalid","sinceMs":5000},"load":null,"maxConcurrentTasks":2,"maxConcurrentTasksUpperBound":8,"mode":"paused","serviceMode":"somethingNew"}}

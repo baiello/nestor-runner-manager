@@ -39,6 +39,8 @@ fn setup() -> Setup {
     harness.supervisor.reconcile();
     let nestor = Arc::new(FakeNestor::new("nestor.test"));
     nestor.set_now(harness.time.load(Ordering::SeqCst));
+    // A server with the scope filter of S6, so the requested ceiling applies.
+    nestor.set_scope_filter(true);
     let secrets = Arc::new(MemorySecretStore::new());
     let keys = Arc::new(MemoryKeyStore::new());
     let time = harness.time.clone();

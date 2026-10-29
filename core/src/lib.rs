@@ -2,7 +2,8 @@
 //!
 //! - [`admission`]: when a "one job" runner may be launched: mode, ceiling, scopes.
 //! - [`supervisor`]: runner lifecycles, launches, drains, crash recovery, adoption after a restart.
-//! - [`process`]: the launcher of real runner processes (`argv`, credential on a pipe).
+//! - [`process`]: the launcher of real runner processes (launch contract v1 of `run-once`).
+//! - [`sweep`]: stopping what a killed runner left behind (M3).
 //! - [`association`]: device authorization, machine key, disassociation and revocation.
 //! - [`nestor`]: what the service needs from the Nestor API, and a fake server.
 //! - [`secrets`]: secrets, the Keychain and the machine key.
@@ -27,4 +28,5 @@ pub mod persist;
 pub mod process;
 pub mod secrets;
 pub mod supervisor;
+pub mod sweep;
 pub mod sys;

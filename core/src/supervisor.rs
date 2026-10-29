@@ -13,7 +13,8 @@
 //! the runner's `SIGTERM` abandons its job.
 //!
 //! None of this is a security boundary (principle 7): the server enforces leases, ceiling, pause
-//! and scope at claim time.
+//! and scope at claim time. Until Nestor announces `capabilities.scope_filter` (S6), the ceiling
+//! actually applied is 1 whatever the requested value (KCA-734 §3).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -26,12 +27,22 @@ use crate::sys::ProcessIdentity;
 
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
+/// Where a runner works: the machine it acts for and the Nestor instance it talks to. Taken from
+/// the association by the supervisor at each launch; never a secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchTarget {
+    pub machine_id: String,
+    /// The instance's host (`nestor.example`); the runner gets `https://<instance>`.
+    pub instance: String,
+}
+
 /// Starts and stops runner processes. [`crate::process::ProcessLauncher`] runs real ones;
 /// [`crate::fake::FakeLauncher`] pretends, for the tests and the demo.
 pub trait Launcher: Send + Sync {
-    /// Launches the one-job process of `runner.generation`, restricted to `runner.scope` when
-    /// set. The runner gets its credential from the launcher, never from the supervisor.
-    fn spawn(&self, runner: &RunnerRecord) -> Result<ProcessIdentity, String>;
+    /// Launches the one-job process of `runner.generation` for `target`. The runner gets its
+    /// credential from the launcher, never from the supervisor. `runner.scope` is what the
+    /// supervisor planned; contract v1 does not pass it to the runner (KCA-734 §3).
+    fn spawn(&self, runner: &RunnerRecord, target: &LaunchTarget) -> Result<ProcessIdentity, String>;
     /// Asks the process to stop claiming and exit once its job, if any, is done. Never
     /// interrupts a job.
     fn drain(&self, runner: &RunnerRecord);
@@ -88,6 +99,8 @@ struct Slot {
     idle_since_ms: Option<u64>,
     last_task_at_ms: Option<u64>,
     crashes: u32,
+    /// Exits "Nestor unreachable" (75) in a row: they back off without counting as crashes.
+    unreachable: u32,
     restart_at_ms: Option<u64>,
     /// Stopped by hand: the supervisor does not launch it again until it is started by hand.
     held: bool,
@@ -118,6 +131,12 @@ struct Inner {
     load: Option<LoadSample>,
     last_admission: Admission,
     last_queue: Option<Queue>,
+    /// Nestor announced `capabilities.scope_filter` (S6): the requested ceiling applies.
+    scope_filter: bool,
+    /// A runner exited 77 (credential refused): nothing is launched until the connection changes.
+    credential_refused: bool,
+    /// The last save failed (why); cleared by the next one that succeeds.
+    save_error: Option<String>,
 }
 
 pub struct Supervisor {
@@ -175,7 +194,7 @@ impl Supervisor {
             Some(path) => format!("{error} (kept as {}); started paused with 1 task at a time", path.display()),
             None => format!("{error}; started paused with 1 task at a time"),
         });
-        let mut regulator = Regulator::new(stored.mode, stored.max_concurrent_tasks);
+        let mut regulator = Regulator::new(stored.mode, effective_ceiling(stored.max_concurrent_tasks, false));
         regulator.set_blocked(Some(BlockReason::Reconciling));
         let slots = stored
             .runners
@@ -194,6 +213,9 @@ impl Supervisor {
                 load: None,
                 last_admission: Admission::Blocked(BlockReason::Reconciling),
                 last_queue: None,
+                scope_filter: false,
+                credential_refused: false,
+                save_error: None,
             }),
             launcher,
             store,
@@ -335,9 +357,7 @@ impl Supervisor {
                 Some(id) => id,
                 // A new runner only while the service manages fewer than the ceiling, so a
                 // runner waiting out its restart delay is not replaced by a fresh one.
-                None if Self::automatic(&inner) < inner.stored.max_concurrent_tasks
-                    && inner.slots.len() < MAX_RUNNERS =>
-                {
+                None if Self::automatic(&inner) < inner.regulator.ceiling() && inner.slots.len() < MAX_RUNNERS => {
                     self.create(&mut inner, None, false)
                 }
                 None => break,
@@ -399,8 +419,9 @@ impl Supervisor {
     }
 
     /// The runner claimed its one job. A second claim is refused and logged: a one-job runner
-    /// never claims twice. A job outside the runner's scope is a violation (B1(b)): it is
-    /// reported and nothing more is launched until that runner ends.
+    /// never claims twice. A job reported outside the runner's scope is a violation (B1(b)): it
+    /// is reported and nothing more is launched until that runner ends. Contract v1 reports no
+    /// scope (`scope` is `None`): only Nestor can tell, at claim time (S6).
     pub fn runner_claimed(
         &self,
         runner_id: &str,
@@ -428,7 +449,7 @@ impl Supervisor {
             slot.idle_since_ms = None;
             match (&slot.record.scope, scope) {
                 (Some(pinned), Some(reported)) if pinned != reported => true,
-                (Some(_), None) => true,
+                (Some(_), None) => false,
                 (None, Some(reported)) => {
                     slot.record.scope = Some(reported.to_string());
                     false
@@ -454,6 +475,46 @@ impl Supervisor {
         Ok(())
     }
 
+    /// The runner broke the launch contract (a `hello` that is not the one it was launched
+    /// with): it is terminated like a forced stop, and not launched again until started by hand.
+    pub fn runner_misbehaved(&self, runner_id: &str, generation: u64, reason: &str) {
+        let mut inner = self.lock();
+        let Ok(slot) = Self::current(&inner, runner_id, generation) else { return };
+        if !slot.state.is_live() || slot.terminating {
+            return;
+        }
+        let record = {
+            let slot = inner.slots.get_mut(runner_id).unwrap();
+            slot.held = true;
+            slot.terminating = true;
+            slot.kill_at_ms = Some(self.now() + self.options.kill_grace_ms);
+            slot.failure = Some(capitalized(reason));
+            slot.record.clone()
+        };
+        self.log(&mut inner, runner_id, LogLevel::Error, format!("{}: terminated.", capitalized(reason)));
+        self.set_state(&mut inner, runner_id, RunnerState::Stopping);
+        self.launcher.terminate(&record, false);
+    }
+
+    /// Processes a runner left behind could not be stopped after the sweep (KCA-734 §4): the
+    /// runner is left `failed` (never a silent success) and the machine raises an error.
+    pub fn sweep_failed(&self, runner_id: &str, generation: u64, remaining: usize) {
+        let mut inner = self.lock();
+        let message = format!("{remaining} process(es) started by runner {runner_id} could not be stopped.");
+        self.emit_error(&mut inner, &message);
+        let current = Self::current(&inner, runner_id, generation).is_ok_and(|s| !s.state.is_live());
+        if current {
+            {
+                let slot = inner.slots.get_mut(runner_id).unwrap();
+                slot.failure = Some(message.clone());
+                slot.held = true;
+            }
+            self.log(&mut inner, runner_id, LogLevel::Error, message);
+            self.set_state(&mut inner, runner_id, RunnerState::Failed);
+            self.persist(&mut inner);
+        }
+    }
+
     /// The runner's process ended. A stale generation is ignored.
     pub fn runner_exited(&self, runner_id: &str, generation: u64, exit: RunnerExit) {
         let mut inner = self.lock();
@@ -475,7 +536,9 @@ impl Supervisor {
             let outcome = match &exit {
                 _ if terminated => TaskOutcome::Stopped,
                 RunnerExit::Finished(outcome) => *outcome,
-                RunnerExit::Crashed(_) => TaskOutcome::RunnerLost,
+                RunnerExit::Crashed(_) | RunnerExit::Usage | RunnerExit::Unreachable | RunnerExit::Revoked => {
+                    TaskOutcome::RunnerLost
+                }
                 RunnerExit::Idle | RunnerExit::Vanished => TaskOutcome::Unknown,
             };
             if let Some(task) = &task_ref {
@@ -513,8 +576,38 @@ impl Supervisor {
                     self.set_state(inner, runner_id, RunnerState::Stopped);
                 }
                 RunnerExit::Finished(_) | RunnerExit::Idle | RunnerExit::Vanished => {
-                    inner.slots.get_mut(runner_id).unwrap().crashes = 0;
+                    let slot = inner.slots.get_mut(runner_id).unwrap();
+                    slot.crashes = 0;
+                    slot.unreachable = 0;
                     self.log(inner, runner_id, LogLevel::Info, "Exited.".into());
+                    self.set_state(inner, runner_id, RunnerState::Stopped);
+                }
+                RunnerExit::Usage => {
+                    let reason = "The runner refused its launch (usage error, exit 64); not launched again.";
+                    self.fail(inner, runner_id, reason);
+                }
+                RunnerExit::Revoked => {
+                    let reason = "Nestor refused the runner's credential (exit 77): the machine may be revoked. \
+                                  No runner is launched until the connection changes.";
+                    self.fail(inner, runner_id, reason);
+                    inner.credential_refused = true;
+                    self.emit_error(inner, reason);
+                }
+                RunnerExit::Unreachable => {
+                    let now = self.now();
+                    let delay = {
+                        let slot = inner.slots.get_mut(runner_id).unwrap();
+                        slot.unreachable += 1;
+                        let delay = self.backoff(slot.unreachable);
+                        slot.restart_at_ms = Some(now + delay);
+                        delay
+                    };
+                    self.log(
+                        inner,
+                        runner_id,
+                        LogLevel::Warning,
+                        format!("Nestor could not be reached (exit 75); next launch in {} s.", delay / 1_000),
+                    );
                     self.set_state(inner, runner_id, RunnerState::Stopped);
                 }
             }
@@ -525,12 +618,23 @@ impl Supervisor {
 
     // MARK: Configuration
 
+    /// A setting that cannot be saved is never acknowledged as a success (KCA-732 nº1): pausing
+    /// still applies at once (the safe direction) but answers an error saying it would not
+    /// survive a restart; resuming is not applied at all.
     pub fn set_mode(&self, mode: Mode, expected_revision: Option<u64>) -> Result<MachineStatus, ServiceError> {
         let mut inner = self.lock();
         Self::check_revision(&inner, expected_revision)?;
+        let previous = inner.stored.mode;
         inner.stored.mode = mode;
         inner.regulator.set_mode(mode);
-        self.config_changed(&mut inner);
+        let safe = mode == Mode::Paused;
+        if let Err(error) = self.config_changed(&mut inner, safe) {
+            if !safe {
+                inner.stored.mode = previous;
+                inner.regulator.set_mode(previous);
+            }
+            return Err(not_saved(&error, safe));
+        }
         Ok(self.status_locked(&inner))
     }
 
@@ -544,14 +648,39 @@ impl Supervisor {
         if value < 1 || value > self.options.ceiling_upper_bound {
             return Err(ServiceError::LimitOutOfRange { min: 1, max: self.options.ceiling_upper_bound });
         }
+        let previous = inner.stored.max_concurrent_tasks;
         inner.stored.max_concurrent_tasks = value;
-        inner.regulator.set_ceiling(value);
-        self.config_changed(&mut inner);
+        let effective = effective_ceiling(value, inner.scope_filter);
+        inner.regulator.set_ceiling(effective);
+        // Lowering is the safe direction: applied even if it cannot be saved.
+        let safe = value <= previous;
+        if let Err(error) = self.config_changed(&mut inner, safe) {
+            if !safe {
+                inner.stored.max_concurrent_tasks = previous;
+                let effective = effective_ceiling(previous, inner.scope_filter);
+                inner.regulator.set_ceiling(effective);
+            }
+            return Err(not_saved(&error, safe));
+        }
         Ok(self.status_locked(&inner))
     }
 
     pub fn max_concurrent_tasks(&self) -> u32 {
         self.lock().stored.max_concurrent_tasks
+    }
+
+    /// What Nestor announced it enforces. Without `scope_filter` (S6) the ceiling applied is 1:
+    /// several tasks side by side need the server to keep workspaces apart at claim time.
+    pub fn set_scope_filter(&self, scope_filter: bool) {
+        let mut inner = self.lock();
+        if inner.scope_filter == scope_filter {
+            return;
+        }
+        inner.scope_filter = scope_filter;
+        let effective = effective_ceiling(inner.stored.max_concurrent_tasks, scope_filter);
+        inner.regulator.set_ceiling(effective);
+        self.refresh_admission(&mut inner);
+        self.drain_surplus(&mut inner, None);
     }
 
     pub fn set_connection(&self, connection: Connection) {
@@ -564,6 +693,7 @@ impl Supervisor {
             return;
         }
         inner.stored.connection = connection.clone();
+        inner.credential_refused = false;
         self.emit(inner, EventKind::ConnectionChanged { connection });
         self.persist(inner);
         self.refresh_admission(inner);
@@ -826,14 +956,21 @@ impl Supervisor {
         }
     }
 
-    fn config_changed(&self, inner: &mut Inner) {
+    /// Saves a settings change first. If it cannot be saved and is not `safe`, nothing is
+    /// applied (the caller restores its fields); a `safe` change is applied in memory anyway.
+    fn config_changed(&self, inner: &mut Inner, safe: bool) -> Result<(), String> {
         inner.stored.config_revision += 1;
+        let saved = self.try_persist(inner);
+        if saved.is_err() && !safe {
+            inner.stored.config_revision -= 1;
+            return saved;
+        }
         let (revision, mode, max) =
             (inner.stored.config_revision, inner.stored.mode, inner.stored.max_concurrent_tasks);
         self.emit(inner, EventKind::ConfigChanged { revision, mode, max_concurrent_tasks: max });
-        self.persist(inner);
         self.refresh_admission(inner);
         self.drain_surplus(inner, None);
+        saved
     }
 
     fn create(&self, inner: &mut Inner, name: Option<String>, manual: bool) -> RunnerId {
@@ -879,7 +1016,13 @@ impl Supervisor {
             slot.record.clone()
         };
         self.set_state(inner, runner_id, RunnerState::Starting);
-        match self.launcher.spawn(&record) {
+        let target = match (&inner.stored.machine_id, &inner.stored.connection) {
+            (Some(machine_id), Connection::Associated { instance, .. }) => {
+                Ok(LaunchTarget { machine_id: machine_id.clone(), instance: instance.clone() })
+            }
+            _ => Err("the machine is not associated".to_string()),
+        };
+        match target.and_then(|target| self.launcher.spawn(&record, &target)) {
             Ok(identity) => {
                 {
                     let slot = inner.slots.get_mut(runner_id).unwrap();
@@ -931,15 +1074,26 @@ impl Supervisor {
                 slot.failure = Some(format!("Exited {} times in a row; last: {reason}", slot.crashes));
                 RunnerState::Failed
             } else {
-                let delay =
-                    options.backoff_base_ms.saturating_mul(1 << (slot.crashes - 1).min(20)).min(options.backoff_max_ms);
-                slot.restart_at_ms = Some(now + delay);
+                slot.restart_at_ms = Some(now + self.backoff(slot.crashes));
                 RunnerState::Stopped
             }
         };
         self.log(inner, runner_id, LogLevel::Error, capitalized(reason));
         self.set_state(inner, runner_id, next);
         self.persist(inner);
+    }
+
+    /// Exponential delay after `attempts` failed launches in a row (1 or more).
+    fn backoff(&self, attempts: u32) -> u64 {
+        let options = &self.options;
+        options.backoff_base_ms.saturating_mul(1 << attempts.saturating_sub(1).min(20)).min(options.backoff_max_ms)
+    }
+
+    /// Left `failed` for a reason that relaunching would not fix.
+    fn fail(&self, inner: &mut Inner, runner_id: &str, reason: &str) {
+        inner.slots.get_mut(runner_id).unwrap().failure = Some(reason.to_string());
+        self.log(inner, runner_id, LogLevel::Error, reason.to_string());
+        self.set_state(inner, runner_id, RunnerState::Failed);
     }
 
     fn set_state(&self, inner: &mut Inner, runner_id: &str, state: RunnerState) {
@@ -965,6 +1119,7 @@ impl Supervisor {
                 Connection::NotAssociated | Connection::Associating { .. } => Some(BlockReason::NotAssociated),
                 Connection::Unreachable { .. } => Some(BlockReason::Unreachable),
                 Connection::Revoked => Some(BlockReason::Revoked),
+                Connection::Associated { .. } if inner.credential_refused => Some(BlockReason::Revoked),
                 Connection::Associated { .. } => None,
             }
         };
@@ -977,14 +1132,31 @@ impl Supervisor {
     }
 
     fn persist(&self, inner: &mut Inner) {
+        let _ = self.try_persist(inner);
+    }
+
+    /// Writes the state. A failure is kept visible in the status (`configError`) until a later
+    /// save succeeds.
+    fn try_persist(&self, inner: &mut Inner) -> Result<(), String> {
         inner.stored.runners = inner.slots.values().map(|s| s.record.clone()).collect();
         let mut stored = inner.stored.clone();
         // An association in progress is never stored: its device code lives in memory only.
         if matches!(stored.connection, Connection::Associating { .. }) {
             stored.connection = Connection::NotAssociated;
         }
-        if let Err(error) = self.store.save(&stored) {
-            self.emit_error(inner, &format!("Could not save the configuration: {error}"));
+        match self.store.save(&stored) {
+            Ok(()) => {
+                inner.save_error = None;
+                Ok(())
+            }
+            Err(error) => {
+                let error = error.to_string();
+                if inner.save_error.is_none() {
+                    self.emit_error(inner, &format!("Could not save the configuration: {error}"));
+                }
+                inner.save_error = Some(error.clone());
+                Err(error)
+            }
         }
     }
 
@@ -1053,6 +1225,8 @@ impl Supervisor {
             mode: inner.stored.mode,
             admission: inner.regulator.admission(),
             max_concurrent_tasks: inner.stored.max_concurrent_tasks,
+            effective_max_concurrent_tasks: inner.regulator.ceiling(),
+            capped_by_server: inner.regulator.ceiling() < inner.stored.max_concurrent_tasks,
             max_concurrent_tasks_upper_bound: self.options.ceiling_upper_bound,
             config_revision: inner.stored.config_revision,
             busy_runners: inner.slots.values().filter(|s| s.state == RunnerState::Busy).count() as u32,
@@ -1060,7 +1234,12 @@ impl Supervisor {
             active_scope: Regulator::active_scope(&Self::live_scopes(inner)).ok().flatten(),
             active_tasks,
             load: inner.load.clone(),
-            config_error: inner.config_error.clone(),
+            config_error: match &inner.save_error {
+                Some(error) => Some(self.redactor.mask(&format!(
+                    "The settings could not be saved ({error}); changes since then will be lost if the service restarts."
+                ))),
+                None => inner.config_error.clone(),
+            },
         }
     }
 }
@@ -1083,10 +1262,31 @@ impl Slot {
             idle_since_ms: None,
             last_task_at_ms: None,
             crashes: 0,
+            unreachable: 0,
             restart_at_ms: None,
             usage: (0.0, 0),
             logs: VecDeque::new(),
         }
+    }
+}
+
+fn not_saved(error: &str, applied: bool) -> ServiceError {
+    ServiceError::Unavailable(if applied {
+        format!(
+            "Applied for now, but the setting could not be saved ({error}): it will be lost if the service restarts."
+        )
+    } else {
+        format!("The setting could not be saved ({error}); nothing changed.")
+    })
+}
+
+/// The ceiling actually applied: the requested one only once Nestor filters scopes at claim
+/// time (`capabilities.scope_filter`, S6); 1 until then (KCA-734 §3).
+pub fn effective_ceiling(requested: u32, scope_filter: bool) -> u32 {
+    if scope_filter {
+        requested.max(1)
+    } else {
+        1
     }
 }
 
@@ -1102,6 +1302,8 @@ fn outcome_text(outcome: TaskOutcome) -> &'static str {
         TaskOutcome::RunnerLost => "runner lost",
         TaskOutcome::Stopped => "stopped",
         TaskOutcome::Unknown => "outcome unknown",
+        TaskOutcome::LeaseLost => "lease lost",
+        TaskOutcome::Released => "given back to Nestor",
     }
 }
 

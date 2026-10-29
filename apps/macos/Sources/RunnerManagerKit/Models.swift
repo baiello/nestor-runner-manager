@@ -229,6 +229,9 @@ public struct MachineStatus: Equatable, Sendable {
     public var mode: AdmissionMode
     public var admission: AdmissionState
     public var maxConcurrentTasks: Int
+    /// What the service actually applies: `maxConcurrentTasks`, or 1 while Nestor cannot yet keep
+    /// workspaces apart at claim time.
+    public var effectiveMaxConcurrentTasks: Int
     /// Highest value accepted for `maxConcurrentTasks` (a sanity check on the input).
     public var maxConcurrentTasksUpperBound: Int
     /// Increases with every settings change; sent back with a change so two windows cannot
@@ -250,12 +253,14 @@ public struct MachineStatus: Equatable, Sendable {
         busyRunners: Int,
         activeTasks: [ActiveTask],
         load: MachineLoad?,
-        configError: String? = nil
+        configError: String? = nil,
+        effectiveMaxConcurrentTasks: Int? = nil
     ) {
         self.serviceMode = serviceMode
         self.mode = mode
         self.admission = admission
         self.maxConcurrentTasks = maxConcurrentTasks
+        self.effectiveMaxConcurrentTasks = effectiveMaxConcurrentTasks ?? maxConcurrentTasks
         self.maxConcurrentTasksUpperBound = maxConcurrentTasksUpperBound
         self.configRevision = configRevision
         self.busyRunners = busyRunners
@@ -263,6 +268,9 @@ public struct MachineStatus: Equatable, Sendable {
         self.load = load
         self.configError = configError
     }
+
+    /// The requested value is above what the server allows for now.
+    public var cappedByServer: Bool { effectiveMaxConcurrentTasks < maxConcurrentTasks }
 }
 
 // MARK: Access to the service

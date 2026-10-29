@@ -53,10 +53,10 @@ Nestor Runner Manager has native interfaces per operating system on top of one s
 
 ## The core
 
-`core/` is a Rust crate (`nestor-runner-core`) with the binary `nestor-runner-service`, run in the user's session — no privileged installation. Modules: `admission`, `supervisor`, `process`, `association`, `nestor`, `secrets`, `persist`, `ipc`, `mask`, `load`, `sys`, `fake`, `demo`. See [core/README.md](../core/README.md).
+`core/` is a Rust crate (`nestor-runner-core`) with the binary `nestor-runner-service`, run in the user's session — no privileged installation. Modules: `admission`, `supervisor`, `process`, `sweep`, `association`, `nestor`, `secrets`, `persist`, `ipc`, `mask`, `load`, `sys`, `fake`, `demo`. The launcher speaks launch contract v1 of `nestor-runner run-once`, whose fixtures are vendored in `contract/run-once-v1.json`. See [core/README.md](../core/README.md).
 
 ## Not in this version
 
-- The Nestor API for machines (S1 to S6) and the runner's one-job mode (S7): until they exist, the live service has no `NestorApi`, answers `unavailable` to `associate` and launches nothing. The association and the launcher are tested against a fake Nestor and a stand-in runner.
+- The Nestor API for machines (S1 to S6): until it exists, the live service has no `NestorApi`, answers `unavailable` to `associate` and launches nothing. The runner's one-job mode exists (`nestor-runner run-once`, S7); the launcher follows its contract v1 and is tested against a double that checks the vendored fixtures. The cross-repository test against the real binary is R2 (KCA-737).
 - Signing (A6): the Secure Enclave key, the Keychain and the verification of the app by the service need it. Start at login (LaunchAgent), notarization, installation on the Mac Studio — not authorized in this lot (contract §6.B, see security.md).
 - Load-driven admission (CPU, memory pressure): after real measurements on the Mac Studio (KCA-717 §9).

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use common::{options, queue, Harness, SCOPE};
 use nestor_runner_core::fake::FakeLauncher;
 use nestor_runner_core::model::*;
-use nestor_runner_core::persist::{FileStore, Loaded, Store};
+use nestor_runner_core::persist::{FileStore, Loaded, MemoryStore, Store, StoredState};
 
 fn file_store(dir: &std::path::Path) -> Arc<dyn Store> {
     Arc::new(FileStore::new(dir).unwrap())
@@ -158,6 +158,9 @@ fn a_restarted_service_adopts_live_runners_instead_of_launching_again() {
     second.supervisor.tick(&queue(10));
     assert_eq!(launcher.spawns(), 2);
     second.supervisor.reconcile();
+    // What Nestor enforces is not stored: until it announces its scope filter again, one at a time.
+    assert_eq!(second.supervisor.status().effective_max_concurrent_tasks, 1);
+    second.supervisor.set_scope_filter(true);
 
     let survivor = launcher.live().remove(0);
     let adopted = second.supervisor.runner(&survivor.runner_id).unwrap();
@@ -226,4 +229,59 @@ fn an_adopted_runner_without_a_known_scope_blocks_other_launches() {
     second.supervisor.tick(&queue(5));
     assert_eq!(launcher.spawns(), 1, "scope unknown: no other task starts next to it");
     assert!(second.supervisor.status().active_scope.is_none());
+}
+
+/// A store whose writes can be made to fail, as on a full disk.
+struct FailingStore {
+    inner: MemoryStore,
+    failing: std::sync::atomic::AtomicBool,
+}
+
+impl Store for FailingStore {
+    fn load(&self) -> Loaded {
+        self.inner.load()
+    }
+
+    fn save(&self, state: &StoredState) -> std::io::Result<()> {
+        if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(std::io::Error::other("no space left on device"));
+        }
+        self.inner.save(state)
+    }
+}
+
+#[test]
+fn a_setting_that_cannot_be_saved_is_never_acknowledged() {
+    let store = Arc::new(FailingStore { inner: MemoryStore::default(), failing: false.into() });
+    let harness = Harness::with(store.clone(), Arc::new(FakeLauncher::new()), options());
+    harness.supervisor.reconcile();
+    harness.associate();
+    harness.supervisor.set_max_concurrent_tasks(2, None).unwrap();
+    store.failing.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // Raising or resuming is not applied when it cannot be saved.
+    let error = harness.supervisor.set_max_concurrent_tasks(4, None).unwrap_err();
+    assert!(matches!(&error, ServiceError::Unavailable(m) if m.contains("nothing changed")), "{error:?}");
+    let status = harness.supervisor.status();
+    assert_eq!(status.max_concurrent_tasks, 2);
+    assert!(status.config_error.as_deref().unwrap().contains("could not be saved"), "visible in the status");
+
+    // Pausing applies at once (the safe direction), and says it would not survive a restart.
+    let error = harness.supervisor.set_mode(Mode::Paused, None).unwrap_err();
+    assert!(matches!(&error, ServiceError::Unavailable(m) if m.contains("lost if the service restarts")));
+    assert_eq!(harness.supervisor.status().mode, Mode::Paused);
+    assert!(harness.supervisor.set_mode(Mode::Automatic, None).is_err());
+    assert_eq!(harness.supervisor.status().mode, Mode::Paused, "resuming is not applied");
+
+    // A restart now restores the last state that was saved: automatic, 2 at a time.
+    let restarted = Harness::with(store.clone(), Arc::new(FakeLauncher::new()), options());
+    let status = restarted.supervisor.status();
+    assert_eq!((status.mode, status.max_concurrent_tasks), (Mode::Automatic, 2));
+    drop(restarted);
+
+    // Once saving works again, the next change is saved and the warning goes away.
+    store.failing.store(false, std::sync::atomic::Ordering::SeqCst);
+    harness.supervisor.set_mode(Mode::Paused, None).unwrap();
+    assert!(harness.supervisor.status().config_error.is_none());
+    assert_eq!(store.load().state().mode, Mode::Paused);
 }

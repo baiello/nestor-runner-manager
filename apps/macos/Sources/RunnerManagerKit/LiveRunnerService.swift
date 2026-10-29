@@ -363,6 +363,8 @@ enum Wire {
         var mode: String
         var admission: Admission
         var maxConcurrentTasks: Int
+        /// Absent from services older than launch contract v1: then what was asked applies.
+        var effectiveMaxConcurrentTasks: Int?
         var maxConcurrentTasksUpperBound: Int
         var configRevision: Int
         var busyRunners: Int
@@ -393,7 +395,8 @@ enum Wire {
                         diskFreeBytes: $0.measuredDiskFreeBytes
                     )
                 },
-                configError: configError
+                configError: configError,
+                effectiveMaxConcurrentTasks: effectiveMaxConcurrentTasks
             )
         }
     }

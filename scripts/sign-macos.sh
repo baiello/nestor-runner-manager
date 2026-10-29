@@ -40,6 +40,11 @@ if [ "$identity" = "-" ]; then
   printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict/></plist>' > "$work/entitlements.plist"
 else
   [ -n "$team" ] || { echo "--team is required with a real identity" >&2; exit 2; }
+  # The service only accepts clients signed with a Developer ID certificate (F1).
+  case "$identity" in
+    "Developer ID Application:"*) ;;
+    *) echo "refusing: sign with a \"Developer ID Application\" identity, not \"$identity\" (F1)" >&2; exit 1 ;;
+  esac
   sed "s/TEAMID/$team/g" "$template" > "$work/entitlements.plist"
 fi
 

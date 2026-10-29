@@ -2,7 +2,7 @@
 
 The interfaces reach the runner service (`core/`, binary `nestor-runner-service`) through this API. It follows the architecture contract (KCA-717 §4, revised by contract v2 in KCA-724 and the security review KCA-727). The macOS client is `LiveRunnerService`; the Rust server is `core/src/ipc.rs`. Security design and test evidence: [security.md](security.md).
 
-Changes from 1.0: access levels by code signature, `confirmed` on sensitive operations, `cancelAssociation`, the `associating` connection, `liveRunners` and `activeScope` in the status, `scope` on runners, the `scope.violation` event, the `confirmationRequired` error, one-job runners (no admission token).
+Changes from 1.0: access levels by code signature, `confirmed` on sensitive operations, `cancelAssociation`, the `associating` connection, `liveRunners` and `activeScope` in the status, `scope` on runners, the `scope.violation` event, the `confirmationRequired` error, one-job runners (no admission token). Added in 1.1 without a version change (fields a client may ignore): `effectiveMaxConcurrentTasks` and `cappedByServer` in the status, the `leaseLost` and `released` outcomes, the places reserved for `full` access and the request delays.
 
 ## Transport and access
 
@@ -18,13 +18,13 @@ Each connection is classified once, from the kernel, when it is accepted:
 | Peer | Access |
 | --- | --- |
 | Another user, or a live runner or one of its descendants | refused (`permissionDenied`, connection closed) |
-| The app, verified by **code signature from the audit token**, with the hardened runtime and without `get-task-allow` | `full` |
+| The app, verified by **code signature from the audit token** (Developer ID certificate of the team), with the hardened runtime, without `get-task-allow` nor any `com.apple.security.cs.*` exception | `full` |
 | The command line tool, verified the same way | `readOnly`: everything but changes and runner `logs` (A4) |
 | Anything else of the same user | `basic`: `hello`, `machineInfo`, `machineStatus` (without task references), `connection` |
-| Anything else, when the service runs with `--allow-unsigned-clients` (development only, off by default) | `full`, reported as `peerVerification: "unsignedFallback"` |
+| Anything else, when a **development build** (Cargo feature `dev-unsigned`, never in a release build nor with `NESTOR_TEAM_ID`) runs with `--allow-unsigned-clients` | `full`, reported as `peerVerification: "unsignedFallback"` |
 
-`hello` tells the client its access. The production code signing requirements name the app (`fr.kocoa.nestor.runner-manager`), the CLI (`….cli`) and the team id given at build time (`NESTOR_TEAM_ID`); without a team id nothing can be verified by signature.
-- Framing: one JSON object per line (UTF-8, `\n`-terminated), at most 64 KiB per request. Requests on a connection are answered in order. At most 16 connections at a time.
+`hello` tells the client its access. The production code signing requirements (`ipc::developer_id_requirement`) name the app (`fr.kocoa.nestor.runner-manager`), the CLI (`….cli`), the Developer ID certificates and the team id given at build time (`NESTOR_TEAM_ID`); without a team id nothing can be verified by signature.
+- Framing: one JSON object per line (UTF-8, `\n`-terminated), at most 64 KiB per request. Requests on a connection are answered in order. At most 16 connections at a time, of which 8 are reserved for `full` access: `basic` and `readOnly` peers get at most 8, so they cannot keep the app out. The first request, and every next one, must come within 10 s; only a `full` connection that asked for `events` may stay quiet up to 300 s.
 
 ## Requests and responses
 
@@ -79,7 +79,9 @@ Operations need the access level of the table above: `hello`, `machineInfo`, `ma
   "connection": {"state": "associated", "instance": "nestor.example", "sinceMs": 1793290000000},
   "mode": "automatic",                   // "automatic" | "paused"
   "admission": {"state": "open"},        // or {"state":"paused"} or {"state":"blocked","reason":"notAssociated"|"unreachable"|"revoked"|"reconciling"}
-  "maxConcurrentTasks": 1,               // default 1
+  "maxConcurrentTasks": 1,               // default 1: what the user asked for
+  "effectiveMaxConcurrentTasks": 1,      // what applies: 1 until Nestor announces its scope filter (S6)
+  "cappedByServer": false,               // true when the requested value is above it: "limited by the server"
   "maxConcurrentTasksUpperBound": 18,    // number of cores: rejects absurd input, limits no resource
   "configRevision": 3,
   "busyRunners": 1,                      // runners holding a task
@@ -88,7 +90,7 @@ Operations need the access level of the table above: `hello`, `machineInfo`, `ma
   "activeTasks": [{"runnerId": "9f…", "runnerName": "runner-1", "taskRef": "…", "startedAtMs": 1793291000000}],
   "load": {"sampledAtMs": 1793291543411, "measuredCpuPercent": 7.8, "measuredMemoryUsedBytes": 19926319104,
            "measuredMemoryTotalBytes": 38654705664, "measuredMemoryPressure": "normal", "measuredDiskFreeBytes": 231194337280},
-  "configError": null                    // set when the stored settings were unreadable: the service then runs paused with 1 task
+  "configError": null                    // set when the stored settings were unreadable (the service then runs paused with 1 task), or when they could not be saved
 }
 
 // Connection
@@ -109,14 +111,14 @@ Operations need the access level of the table above: `hello`, `machineInfo`, `ma
 {"atMs": 0, "level": "info" | "warning" | "error", "message": "[demo] Task demo-task-1 started."}
 ```
 
-Runner states. A managed runner is a **one-job** process: `stopped` → `starting` (launched) → `ready` (waiting to claim) → `busy` (one task) → exits → `stopped`; the next task launches it again with a new generation. `stopping`: drained (no new claim; its task, if any, finishes) or terminated. `failed` after five unexpected exits in a row. `taskRef` and `scope` are Nestor's opaque references; no task content is kept or shown locally. Names are 1 to 40 ASCII letters, digits, spaces, `-`, `_` or `.`.
+Runner states. A managed runner is a **one-job** process: `stopped` → `starting` (launched) → `ready` (waiting to claim) → `busy` (one task) → exits → `stopped`; the next task launches it again with a new generation. `stopping`: drained (no new claim; its task, if any, finishes) or terminated. `failed` after five unexpected exits in a row, or at once when the runner refuses its launch (exit 64), when Nestor refuses its credential (exit 77: no runner is launched until the connection changes) or when what it started could not be stopped. `taskRef` and `scope` are Nestor's opaque references; no task content is kept or shown locally. Names are 1 to 40 ASCII letters, digits, spaces, `-`, `_` or `.`.
 
 ## Admission rules
 
-- **Launching a runner is the admission.** There is no local token. A one-job runner is launched only when the mode is `automatic`, the service is not blocked (not associated, unreachable, revoked, reconciling), fewer runners are alive than `maxConcurrentTasks`, and Nestor reports eligible jobs in the active scope.
-- **Scopes (B1(b)).** While runners are alive they all share one scope (`activeScope`), and each is launched with it as a restrictive filter for its claim. A runner of unknown scope blocks other launches until it ends; a task reported outside its runner's scope raises `scope.violation` and blocks launches until it ends. Nestor enforces the same rule at claim time (S6).
+- **Launching a runner is the admission.** There is no local token. A one-job runner is launched only when the mode is `automatic`, the service is not blocked (not associated, unreachable, revoked, reconciling), fewer runners are alive than `effectiveMaxConcurrentTasks`, and Nestor reports eligible jobs in the active scope. Until Nestor announces `capabilities.scope_filter` (S6), `effectiveMaxConcurrentTasks` is 1 whatever `maxConcurrentTasks` says (KCA-734 §3).
+- **Scopes (B1(b)).** While runners are alive they all share one scope (`activeScope`). Launch contract v1 does **not** pass the scope to the runner (`--scope` comes back with S6): until then only Nestor can keep workspaces apart, hence the ceiling of 1. A runner of unknown scope blocks other launches until it ends; a task reported outside its runner's scope raises `scope.violation` and blocks launches until it ends. Nestor enforces the same rule at claim time (S6).
 - **Pause**, **lowering the ceiling** and losing the connection only stop launching, and **drain** the runners that have no task yet (they stop claiming and exit). No running task is stopped. Runners waiting 60 s with nothing eligible in their scope are drained too.
-- **Termination** (revocation, disassociation, forced stop) is the only thing that ends a running task: SIGTERM to the runner's process group, SIGKILL after 10 s.
+- **Termination** (revocation, disassociation, forced stop) is the only thing that ends a running task: SIGTERM to the runner's process group, SIGKILL after 10 s, then a sweep of what the runner started (M3, see security.md).
 - After a restart, the service is `blocked: reconciling` until it has adopted the runner processes still alive (only if pid, start time and generation all match; they count toward the ceiling and drain) and cleared the others. It never launches a runner over a live one, and never signals a pid it cannot recognize.
 - None of this is a security control: Nestor enforces the lease ceiling, the pause and the scope at claim time.
 
@@ -136,7 +138,7 @@ Every event has `seq` (increasing) and `atMs`, plus a `type`:
 {"seq": 20, "atMs": 1793291576004, "type": "scope.violation", "runnerId": "9f…"}
 ```
 
-`outcome` is `succeeded`, `failed`, `runnerLost` (the runner died during the task; Nestor's existing policy decides what happens to it), `stopped` (terminated on purpose: forced stop, disassociation, revocation) or `unknown` (an adopted runner ended).
+`outcome` is `succeeded`, `failed`, `runnerLost` (the runner died during the task; Nestor's existing policy decides what happens to it), `stopped` (terminated on purpose, or abandoned by the runner), `leaseLost` (the runner lost its lease and stopped the job), `released` (the runner gave the job back to Nestor without running it) or `unknown` (an adopted runner ended, or the runner exited without saying how its job ended). The outcome comes from the runner's `finished` report; the report channel is not trusted for anything else.
 
 Every message — logs, events, error messages — is masked at the source: secrets the service handles and anything that looks like a credential are replaced by `[masked]`.
 

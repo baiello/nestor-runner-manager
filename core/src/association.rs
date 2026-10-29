@@ -258,6 +258,7 @@ impl Associator {
                 if let Connection::Unreachable { .. } = connection {
                     self.supervisor.set_connection(Connection::Associated { instance, since_ms: self.now() });
                 }
+                self.supervisor.set_scope_filter(api.capabilities().scope_filter);
                 queue
             }
             Err(ApiError::Unreachable(reason)) => {

@@ -22,14 +22,16 @@ Shared core of Nestor Runner Manager, in Rust: the local runner service the inte
 
 ```sh
 cd core
-cargo test                                   # unit and acceptance tests (fake and stand-in runners, real socket)
+cargo test                                   # unit and acceptance tests (fake runners, run-once double, real socket)
 cargo run --bin nestor-runner-service        # live: real settings, measurements and API; not associated, no runner
-cargo run --bin nestor-runner-service -- --simulate --allow-unsigned-clients   # demo, usable by an unsigned dev build of the app
+cargo run --features dev-unsigned --bin nestor-runner-service -- --simulate --allow-unsigned-clients
+                                             # demo, usable by an unsigned dev build of the app
+../scripts/release-service.sh                # release build; refuses the dev-unsigned feature (M1)
 ```
 
-Options: `--data-dir DIR` (default `~/Library/Application Support/Nestor Runner Manager/live` or `…/demo`), `--socket PATH` (default `DIR/run/service.sock`; never a shared temporary directory), `--allow-unsigned-clients` (development only: gives unsigned clients full access, and says so to every client). Without it, an unsigned build of the app only gets read access to the status.
+Options: `--data-dir DIR` (default `~/Library/Application Support/Nestor Runner Manager/live` or `…/demo`), `--socket PATH` (default `DIR/run/service.sock`; never a shared temporary directory), `--allow-unsigned-clients` (only in a development build with the `dev-unsigned` Cargo feature and without `NESTOR_TEAM_ID`: gives unsigned clients full access, and says so to every client; any other build rejects it with exit 64). Without it, an unsigned build of the app only gets read access to the status. Usage errors exit 64.
 
-`examples/fake_one_job_runner.rs` is a stand-in for the Nestor runner's one-job mode, used by `tests/process.rs`; it claims nothing from Nestor.
+`examples/run_once_double.rs` is a double of `nestor-runner run-once` that checks launch contract v1 against `contract/run-once-v1.json` (argv, fds 3 and 4, credential JSON, reports, drain), used by `tests/process.rs`; it claims nothing from Nestor. `tests/contract_fixtures.rs` checks the launcher and the report reader against the same fixtures.
 
 Then, from `apps/macos`: `swift run NestorRunnerManager --service` (live) or `--socket "$HOME/Library/Application Support/Nestor Runner Manager/demo/run/service.sock"` (simulated).
 

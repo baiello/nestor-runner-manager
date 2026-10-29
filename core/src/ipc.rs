@@ -8,8 +8,10 @@
 //! 1. The peer's user id must be the service's (`getpeereid`); otherwise refused.
 //! 2. A peer that is a live runner or one of its descendants is refused.
 //! 3. The peer's **audit token** (not its pid, which can be reused) is checked against the code
-//!    signing requirements of the app and of the command line tool, and must have the hardened
-//!    runtime without `get-task-allow` (so nothing of the same user can inject code into it).
+//!    signing requirements of the app and of the command line tool ([`developer_id_requirement`]:
+//!    a Developer ID certificate of the team, F1), and must have the hardened runtime without
+//!    `get-task-allow` nor any `com.apple.security.cs.*` exception (so nothing of the same user
+//!    can inject code into it).
 //!    The app gets `full` access. The command line tool gets `readOnly` access, without runner
 //!    logs, in this version (A4: a task can run the signed CLI too).
 //! 4. Anything else gets `basic` access (`hello`, `machineInfo`, `machineStatus` without task
@@ -31,7 +33,6 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -44,10 +45,28 @@ use crate::model::*;
 use crate::supervisor::Supervisor;
 use crate::sys;
 
+/// The code signing requirement of a client of the service: `identifier`, signed with a
+/// **Developer ID** certificate (Developer ID CA intermediate, Developer ID Application leaf) of
+/// `team` (F1). An "Apple Development" certificate of the same team does not pass.
+pub fn developer_id_requirement(identifier: &str, team: &str) -> String {
+    format!(
+        "anchor apple generic and identifier \"{identifier}\" and certificate 1[field.1.2.840.113635.100.6.2.6] exists \
+         and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"{team}\""
+    )
+}
+
 pub const API_VERSION: &str = "1.1";
 pub const API_MAJOR: u32 = 1;
 const MAX_LINE_BYTES: u64 = 64 * 1024;
-const MAX_CONNECTIONS: usize = 16;
+/// Connections at a time, of which [`RESERVED_FOR_FULL`] only for `full` access (F3): peers
+/// with less access cannot keep the app out.
+pub const MAX_CONNECTIONS: usize = 16;
+pub const RESERVED_FOR_FULL: usize = 8;
+/// The first request must come within this delay, and so must every next one, except on a
+/// `full` connection that subscribed to events.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a `full` connection that asked for `events` may stay quiet.
+pub const SUBSCRIPTION_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -255,7 +274,11 @@ impl Service {
             {
                 let Some(requirement) = requirement else { continue };
                 if let Ok(signature) = sys::check_peer_signature(token, requirement) {
-                    if signature.satisfies && signature.hardened_runtime && !signature.get_task_allow {
+                    if signature.satisfies
+                        && signature.hardened_runtime
+                        && !signature.get_task_allow
+                        && !signature.runtime_exceptions
+                    {
                         return Peer { access, verification: PeerVerification::Signature };
                     }
                 }
@@ -379,6 +402,35 @@ impl Service {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn places_are_reserved_for_full_access() {
+        let slots = Arc::new(ConnectionSlots::default());
+        let basic: Vec<SlotGuard> =
+            (0..MAX_CONNECTIONS - RESERVED_FOR_FULL).map(|_| slots.try_acquire(Access::Basic).unwrap()).collect();
+        assert!(slots.try_acquire(Access::Basic).is_none(), "basic peers stop at 8");
+        assert!(slots.try_acquire(Access::ReadOnly).is_none(), "so does the read-only CLI");
+        let full: Vec<SlotGuard> = (0..RESERVED_FOR_FULL).map(|_| slots.try_acquire(Access::Full).unwrap()).collect();
+        assert!(slots.try_acquire(Access::Full).is_none(), "16 in all");
+        drop(basic);
+        assert!(slots.try_acquire(Access::Full).is_some(), "places given back");
+        drop(full);
+        assert!(slots.try_acquire(Access::Basic).is_some());
+    }
+
+    #[test]
+    fn the_developer_id_requirement_names_the_certificates() {
+        let requirement = developer_id_requirement("fr.kocoa.nestor.runner-manager", "TEAMID1234");
+        assert!(requirement.contains("certificate 1[field.1.2.840.113635.100.6.2.6] exists"), "{requirement}");
+        assert!(requirement.contains("certificate leaf[field.1.2.840.113635.100.6.1.13] exists"), "{requirement}");
+        assert!(requirement.contains(r#"identifier "fr.kocoa.nestor.runner-manager""#), "{requirement}");
+        assert!(requirement.contains(r#"certificate leaf[subject.OU] = "TEAMID1234""#), "{requirement}");
+    }
+}
+
 fn checked_id(raw: &str) -> Result<String, ServiceError> {
     if is_runner_id(raw) {
         Ok(raw.to_string())
@@ -486,38 +538,77 @@ pub fn peer_uid(stream: &UnixStream) -> Option<u32> {
     sys::peer_uid(stream)
 }
 
+/// The connections open at a time, by access (F3): at most [`MAX_CONNECTIONS`], and at most
+/// `MAX_CONNECTIONS - RESERVED_FOR_FULL` without `full` access.
+#[derive(Default)]
+pub struct ConnectionSlots {
+    /// (all, without full access)
+    open: Mutex<(usize, usize)>,
+}
+
+/// A place taken in [`ConnectionSlots`], given back on drop.
+pub struct SlotGuard {
+    slots: Arc<ConnectionSlots>,
+    full: bool,
+}
+
+impl ConnectionSlots {
+    pub fn try_acquire(self: &Arc<Self>, access: Access) -> Option<SlotGuard> {
+        let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
+        let full = access == Access::Full;
+        if open.0 >= MAX_CONNECTIONS || (!full && open.1 >= MAX_CONNECTIONS - RESERVED_FOR_FULL) {
+            return None;
+        }
+        open.0 += 1;
+        if !full {
+            open.1 += 1;
+        }
+        Some(SlotGuard { slots: Arc::clone(self), full })
+    }
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        let mut open = self.slots.open.lock().unwrap_or_else(|p| p.into_inner());
+        open.0 -= 1;
+        if !self.full {
+            open.1 -= 1;
+        }
+    }
+}
+
 /// Accepts connections until the listener fails. Each connection is classified, then gets its
 /// own thread; requests on a connection are answered in order.
 pub fn serve(listener: &UnixListener, service: Arc<Service>) {
-    let open = Arc::new(AtomicUsize::new(0));
+    let slots = Arc::new(ConnectionSlots::default());
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
         let Some(peer) = service.classify(&stream) else {
             let _ = writeln!(stream, "{}", respond_with(None, Err(ServiceError::PermissionDenied), None));
             continue;
         };
-        if open.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
-            open.fetch_sub(1, Ordering::SeqCst);
+        let Some(slot) = slots.try_acquire(peer.access) else {
             let _ = writeln!(
                 stream,
                 "{}",
                 respond_with(None, Err(ServiceError::Unavailable("Too many clients.".into())), None)
             );
             continue;
-        }
+        };
         let service = Arc::clone(&service);
-        let open = Arc::clone(&open);
         std::thread::spawn(move || {
             let _ = handle_connection(stream, &service, peer);
-            open.fetch_sub(1, Ordering::SeqCst);
+            drop(slot);
         });
     }
 }
 
 pub fn handle_connection(stream: UnixStream, service: &Service, peer: Peer) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(300)))?;
+    stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
     let mut writer = stream.try_clone()?;
-    let mut reader = BufReader::new(stream);
+    let reader_stream = stream.try_clone()?;
+    let mut reader = BufReader::new(reader_stream);
+    let mut subscribed = false;
     loop {
         let mut line = String::new();
         let read = (&mut reader).take(MAX_LINE_BYTES).read_line(&mut line)?;
@@ -533,7 +624,15 @@ pub fn handle_connection(stream: UnixStream, service: &Service, peer: Peer) -> s
             continue;
         }
         writeln!(writer, "{}", service.handle_line(line.trim_end(), peer))?;
+        if !subscribed && peer.access == Access::Full && is_events_request(&line) {
+            subscribed = true;
+            stream.set_read_timeout(Some(SUBSCRIPTION_TIMEOUT))?;
+        }
     }
+}
+
+fn is_events_request(line: &str) -> bool {
+    serde_json::from_str::<Value>(line).is_ok_and(|v| v.get("op").and_then(Value::as_str) == Some("events"))
 }
 
 /// One service per data directory: an exclusive `flock` on an open descriptor, held for the life

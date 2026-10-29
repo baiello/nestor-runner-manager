@@ -69,8 +69,20 @@ pub enum ApiError {
     Rejected(String),
 }
 
+/// What the Nestor instance announces it enforces itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Capabilities {
+    /// The claim filters scopes atomically and never hands out a job of another scope (S6). Until
+    /// it is announced, the service runs one task at a time (KCA-734 §3).
+    pub scope_filter: bool,
+}
+
 pub trait NestorApi: Send + Sync {
     fn instance(&self) -> String;
+    /// Nothing is announced by default: the routes of S6 do not exist yet.
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::default()
+    }
     fn start_device_authorization(&self, request: &DeviceRequest) -> Result<DeviceAuthorization, ApiError>;
     fn poll_device_authorization(&self, device_code: &Secret, proof: &Proof) -> Result<DevicePoll, ApiError>;
     /// The eligible jobs per scope, capped, no content (S4).
@@ -110,6 +122,7 @@ struct FakeState {
     machines: BTreeMap<String, FakeMachine>,
     queue: Queue,
     unreachable: bool,
+    scope_filter: bool,
     auto_approve: bool,
     next: u64,
     revocations: Vec<String>,
@@ -163,6 +176,11 @@ impl FakeNestor {
 
     pub fn set_queue(&self, queue: Queue) {
         self.state.lock().unwrap().queue = queue;
+    }
+
+    /// Announces (or not) the scope filter of S6.
+    pub fn set_scope_filter(&self, scope_filter: bool) {
+        self.state.lock().unwrap().scope_filter = scope_filter;
     }
 
     pub fn set_unreachable(&self, unreachable: bool) {
@@ -236,6 +254,10 @@ impl NestorApi for FakeNestor {
         self.instance.clone()
     }
 
+    fn capabilities(&self) -> Capabilities {
+        Capabilities { scope_filter: self.state.lock().unwrap().scope_filter }
+    }
+
     fn start_device_authorization(&self, request: &DeviceRequest) -> Result<DeviceAuthorization, ApiError> {
         let mut state = self.state.lock().unwrap();
         Self::check(&mut state)?;
@@ -286,7 +308,7 @@ impl NestorApi for FakeNestor {
         }
         state.pending[index].consumed = true;
         state.next += 1;
-        let machine_id = format!("m{:015}", state.next);
+        let machine_id = format!("00000000-0000-4000-8000-{:012x}", state.next);
         let credential = format!("nestor_machine_{:032x}", digest(&format!("{machine_id}-{now}-secret")));
         state.machines.insert(
             machine_id.clone(),

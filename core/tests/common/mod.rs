@@ -51,7 +51,14 @@ impl Harness {
         harness
     }
 
+    /// Associated with a Nestor that filters scopes at claim time (S6), so the requested ceiling
+    /// applies; [`Harness::associate_without_scope_filter`] for today's servers.
     pub fn associate(&self) {
+        self.associate_without_scope_filter();
+        self.supervisor.set_scope_filter(true);
+    }
+
+    pub fn associate_without_scope_filter(&self) {
         self.supervisor.set_machine_id(Some("m-test".into()));
         self.supervisor.set_connection(Connection::Associated { instance: "test.invalid".into(), since_ms: 0 });
     }

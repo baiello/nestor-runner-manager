@@ -58,6 +58,26 @@ pub fn parent_pid(pid: u32) -> Option<u32> {
 /// the same user.
 #[cfg(target_os = "macos")]
 pub fn process_arguments(pid: u32) -> Option<Vec<String>> {
+    procargs(pid).map(|(arguments, _)| arguments)
+}
+
+/// The environment a process was started with (`KERN_PROCARGS2`, after the arguments). Only
+/// readable for processes of the same user, and empty on recent macOS versions, which no longer
+/// expose another process's environment.
+#[cfg(target_os = "macos")]
+pub fn process_environment(pid: u32) -> Option<Vec<(String, String)>> {
+    procargs(pid).map(|(_, environment)| environment)
+}
+
+/// The arguments and the environment of a process.
+#[cfg(target_os = "macos")]
+type ProcArgs = (Vec<String>, Vec<(String, String)>);
+
+#[cfg(target_os = "macos")]
+fn procargs(pid: u32) -> Option<ProcArgs> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return None;
+    }
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
     let mut size: libc::size_t = 0;
     if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, std::ptr::null_mut(), &mut size, std::ptr::null_mut(), 0) } != 0 {
@@ -76,14 +96,162 @@ pub fn process_arguments(pid: u32) -> Option<Vec<String>> {
     }
     let argc = i32::from_ne_bytes(buffer[..4].try_into().ok()?) as usize;
     let mut rest = &buffer[4..];
-    // The executable path, then padding zeros, then argv.
+    // The executable path, then padding zeros, then argv, then the environment.
     let end = rest.iter().position(|b| *b == 0)?;
     rest = &rest[end..];
     let start = rest.iter().position(|b| *b != 0)?;
     rest = &rest[start..];
+    let mut parts = rest.split(|b| *b == 0);
     let arguments: Vec<String> =
-        rest.split(|b| *b == 0).take(argc).map(|part| String::from_utf8_lossy(part).into_owned()).collect();
-    (arguments.len() == argc).then_some(arguments)
+        parts.by_ref().take(argc).map(|part| String::from_utf8_lossy(part).into_owned()).collect();
+    if arguments.len() != argc {
+        return None;
+    }
+    let environment = parts
+        .take_while(|part| !part.is_empty())
+        .filter_map(|part| {
+            let text = String::from_utf8_lossy(part);
+            text.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))
+        })
+        .collect();
+    Some((arguments, environment))
+}
+
+/// What the sweep of a runner's processes needs to know about a process (KCA-734 §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub ppid: u32,
+    pub pgid: u32,
+    pub uid: u32,
+    pub start_time_us: u64,
+    /// Ended, waiting for its parent to collect it: nothing left to stop.
+    pub zombie: bool,
+}
+
+impl ProcessInfo {
+    pub fn identity(&self) -> ProcessIdentity {
+        ProcessIdentity { pid: self.pid, start_time_us: self.start_time_us }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn process_info(pid: u32) -> Option<ProcessInfo> {
+    bsd_info(pid).map(|info| ProcessInfo {
+        pid,
+        ppid: info.pbi_ppid,
+        pgid: info.pbi_pgid,
+        uid: info.pbi_uid,
+        start_time_us: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
+        zombie: info.pbi_status == libc::SZOMB,
+    })
+}
+
+/// Every process id on the system.
+#[cfg(target_os = "macos")]
+pub fn all_pids() -> Vec<u32> {
+    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if count <= 0 {
+        return Vec::new();
+    }
+    // Room for processes started meanwhile.
+    let mut pids = vec![0 as libc::c_int; count as usize + 64];
+    let size = (pids.len() * std::mem::size_of::<libc::c_int>()) as libc::c_int;
+    let filled = unsafe { libc::proc_listallpids(pids.as_mut_ptr() as *mut libc::c_void, size) };
+    pids.truncate(filled.max(0) as usize);
+    pids.into_iter().filter(|pid| *pid > 0).map(|pid| pid as u32).collect()
+}
+
+/// The paths of the files and directories a process of the same user has open.
+#[cfg(target_os = "macos")]
+pub fn process_open_paths(pid: u32) -> Vec<std::path::PathBuf> {
+    // `struct vnode_fdinfowithpath` of <sys/proc_info.h>, not in the libc crate.
+    #[repr(C)]
+    struct FileInfo {
+        open_flags: u32,
+        status: u32,
+        offset: i64,
+        kind: i32,
+        guard_flags: u32,
+    }
+    #[repr(C)]
+    struct VnodeWithPath {
+        file: FileInfo,
+        path: libc::vnode_info_path,
+    }
+    const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
+
+    if pid == 0 || pid > i32::MAX as u32 {
+        return Vec::new();
+    }
+    let item = std::mem::size_of::<libc::proc_fdinfo>();
+    let size = unsafe { libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    if size <= 0 {
+        return Vec::new();
+    }
+    let mut fds: Vec<libc::proc_fdinfo> = Vec::with_capacity(size as usize / item + 16);
+    let capacity = (fds.capacity() * item) as libc::c_int;
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDLISTFDS,
+            0,
+            fds.as_mut_ptr() as *mut libc::c_void,
+            capacity,
+        )
+    };
+    if filled <= 0 {
+        return Vec::new();
+    }
+    unsafe { fds.set_len(filled as usize / item) };
+    fds.iter()
+        .filter(|fd| fd.proc_fdtype == libc::PROX_FDTYPE_VNODE as u32)
+        .filter_map(|fd| {
+            let mut info: VnodeWithPath = unsafe { std::mem::zeroed() };
+            let size = std::mem::size_of::<VnodeWithPath>() as libc::c_int;
+            let read = unsafe {
+                libc::proc_pidfdinfo(
+                    pid as libc::c_int,
+                    fd.proc_fd,
+                    PROC_PIDFDVNODEPATHINFO,
+                    &mut info as *mut _ as *mut libc::c_void,
+                    size,
+                )
+            };
+            (read == size).then(|| path_of(&info.path))?
+        })
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn path_of(info: &libc::vnode_info_path) -> Option<std::path::PathBuf> {
+    let raw: &[libc::c_char] =
+        unsafe { std::slice::from_raw_parts(info.vip_path.as_ptr() as *const libc::c_char, 32 * 32) };
+    let bytes: Vec<u8> = raw.iter().take_while(|c| **c != 0).map(|c| *c as u8).collect();
+    (!bytes.is_empty()).then(|| std::path::PathBuf::from(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+/// The current directory of a process of the same user.
+#[cfg(target_os = "macos")]
+pub fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return None;
+    }
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if read != size {
+        return None;
+    }
+    path_of(&info.pvi_cdir)
 }
 
 #[cfg(target_os = "linux")]
@@ -105,6 +273,51 @@ pub fn parent_pid(pid: u32) -> Option<u32> {
 pub fn process_arguments(pid: u32) -> Option<Vec<String>> {
     let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     Some(raw.split(|b| *b == 0).filter(|p| !p.is_empty()).map(|p| String::from_utf8_lossy(p).into_owned()).collect())
+}
+
+#[cfg(target_os = "linux")]
+pub fn process_environment(pid: u32) -> Option<Vec<(String, String)>> {
+    let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    Some(
+        raw.split(|b| *b == 0)
+            .filter_map(|p| String::from_utf8_lossy(p).split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+            .collect(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub fn process_info(pid: u32) -> Option<ProcessInfo> {
+    use std::os::unix::fs::MetadataExt;
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after: Vec<&str> = stat[stat.rfind(')')? + 2..].split_whitespace().collect();
+    let uid = std::fs::metadata(format!("/proc/{pid}")).ok()?.uid();
+    Some(ProcessInfo {
+        pid,
+        ppid: after.get(1)?.parse().ok()?,
+        pgid: after.get(2)?.parse().ok()?,
+        uid,
+        start_time_us: after.get(19)?.parse().ok()?,
+        zombie: *after.first()? == "Z",
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub fn all_pids() -> Vec<u32> {
+    std::fs::read_dir("/proc")
+        .map(|entries| entries.flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect())
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "linux")]
+pub fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+#[cfg(target_os = "linux")]
+pub fn process_open_paths(pid: u32) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .map(|entries| entries.flatten().filter_map(|e| std::fs::read_link(e.path()).ok()).collect())
+        .unwrap_or_default()
 }
 
 /// Whether `pid` is `ancestor` or one of its descendants, by walking up the parents. A process
@@ -247,6 +460,10 @@ mod security {
         fn CFNumberCreate(alloc: CFAllocatorRef, kind: CFIndex, value: *const c_void) -> CFNumberRef;
         fn CFNumberGetValue(number: CFNumberRef, kind: CFIndex, value: *mut c_void) -> Boolean;
         fn CFErrorCopyDescription(error: CFErrorRef) -> CFStringRef;
+        fn CFDictionaryGetCount(dictionary: CFDictionaryRef) -> CFIndex;
+        fn CFDictionaryGetKeysAndValues(dictionary: CFDictionaryRef, keys: *mut CFTypeRef, values: *mut CFTypeRef);
+        fn CFGetTypeID(value: CFTypeRef) -> usize;
+        fn CFStringGetTypeID() -> usize;
     }
 
     #[link(name = "Security", kind = "framework")]
@@ -418,6 +635,34 @@ mod security {
         pub hardened_runtime: bool,
         /// Carries `com.apple.security.get-task-allow`: another process may take its task port.
         pub get_task_allow: bool,
+        /// Carries a hardened runtime exception (`com.apple.security.cs.*`, such as
+        /// `disable-library-validation` or `allow-dyld-environment-variables`): code of the same
+        /// user could be loaded into it (F1).
+        pub runtime_exceptions: bool,
+    }
+
+    /// The text of a CFString, if `value` is one.
+    fn text_of(value: CFTypeRef) -> Option<String> {
+        if value.is_null() || unsafe { CFGetTypeID(value) != CFStringGetTypeID() } {
+            return None;
+        }
+        let mut buffer = [0 as c_char; 256];
+        let ok =
+            unsafe { CFStringGetCString(value, buffer.as_mut_ptr(), buffer.len() as CFIndex, kCFStringEncodingUTF8) };
+        (ok != 0).then(|| unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_string_lossy().into_owned())
+    }
+
+    /// The keys of an entitlements dictionary whose value is not `false`.
+    fn granted_entitlements(entitlements: CFDictionaryRef) -> Vec<String> {
+        let count = unsafe { CFDictionaryGetCount(entitlements) }.max(0) as usize;
+        let mut keys = vec![ptr::null(); count];
+        let mut values = vec![ptr::null(); count];
+        unsafe { CFDictionaryGetKeysAndValues(entitlements, keys.as_mut_ptr(), values.as_mut_ptr()) };
+        keys.iter()
+            .zip(&values)
+            .filter(|(_, value)| **value != unsafe { kCFBooleanFalse })
+            .filter_map(|(key, _)| text_of(*key))
+            .collect()
     }
 
     /// Checks the process behind `token` against the code signing `requirement` (for example
@@ -452,7 +697,7 @@ mod security {
                 &mut information,
             )
         };
-        let (mut hardened_runtime, mut get_task_allow) = (false, false);
+        let (mut hardened_runtime, mut get_task_allow, mut runtime_exceptions) = (false, false, false);
         if status == 0 {
             if let Some(information) = Owned::new(information) {
                 let flags = unsafe { CFDictionaryGetValue(information.get(), kSecCodeInfoFlags) };
@@ -466,10 +711,13 @@ mod security {
                     let key = string("com.apple.security.get-task-allow");
                     let value = unsafe { CFDictionaryGetValue(entitlements, key.get()) };
                     get_task_allow = !value.is_null() && value == unsafe { kCFBooleanTrue };
+                    runtime_exceptions = granted_entitlements(entitlements)
+                        .iter()
+                        .any(|name| name.starts_with("com.apple.security.cs."));
                 }
             }
         }
-        Ok(PeerSignature { satisfies, hardened_runtime, get_task_allow })
+        Ok(PeerSignature { satisfies, hardened_runtime, get_task_allow, runtime_exceptions })
     }
 
     // MARK: Keys
@@ -721,11 +969,6 @@ mod security {
             status => Err(format!("Keychain error {status}")),
         }
     }
-
-    #[allow(dead_code)]
-    fn unused() -> CFTypeRef {
-        unsafe { kCFBooleanFalse }
-    }
 }
 
 #[cfg(test)]
@@ -741,9 +984,32 @@ mod tests {
         assert!(!older.is_current(), "same pid, another start time: not the same process");
         assert!(descends_from(child.id(), std::process::id()));
         assert_eq!(process_arguments(child.id()).unwrap(), vec!["/bin/sleep".to_string(), "5".to_string()]);
+        let info = process_info(child.id()).unwrap();
+        assert_eq!((info.ppid, info.uid, info.zombie), (std::process::id(), unsafe { libc::geteuid() }, false));
+        assert!(all_pids().contains(&child.id()));
+        assert_eq!(process_cwd(child.id()).unwrap(), std::env::current_dir().unwrap().canonicalize().unwrap());
+        // Recent macOS versions no longer expose another process's environment.
+        let environment = process_environment(child.id()).unwrap();
+        if cfg!(target_os = "linux") {
+            assert!(environment.contains(&("HOME".to_string(), std::env::var("HOME").unwrap())), "{environment:?}");
+        }
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(!identity.is_current());
+    }
+
+    #[test]
+    fn open_files_are_listed() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("out.log");
+        let output = std::fs::File::create(&file).unwrap();
+        let mut child =
+            std::process::Command::new("/bin/sleep").arg("5").current_dir("/").stdout(output).spawn().unwrap();
+        let canonical = file.canonicalize().unwrap();
+        let paths = process_open_paths(child.id());
+        assert!(paths.contains(&canonical), "{paths:?}");
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]

@@ -13,6 +13,11 @@ path = "src/lib.rs"
 name = "nestor-runner-service"
 path = "src/bin/nestor-runner-service.rs"
 
+[features]
+# Development only (M1): accepts --allow-unsigned-clients. Refused at compile time in a release
+# build; scripts/release-service.sh refuses to build with it.
+dev-unsigned = []
+
 [dependencies]
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }

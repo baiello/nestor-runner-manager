@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use crate::persist::RunnerRecord;
-use crate::supervisor::Launcher;
+use crate::supervisor::{LaunchTarget, Launcher};
 use crate::sys::ProcessIdentity;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,7 +99,7 @@ impl FakeLauncher {
 }
 
 impl Launcher for FakeLauncher {
-    fn spawn(&self, runner: &RunnerRecord) -> Result<ProcessIdentity, String> {
+    fn spawn(&self, runner: &RunnerRecord, _target: &LaunchTarget) -> Result<ProcessIdentity, String> {
         let mut state = self.state.lock().unwrap();
         if state.fail_spawns {
             return Err("simulated launch failure".into());
@@ -155,7 +155,7 @@ impl Launcher for FakeLauncher {
 pub struct UnavailableLauncher;
 
 impl Launcher for UnavailableLauncher {
-    fn spawn(&self, _runner: &RunnerRecord) -> Result<ProcessIdentity, String> {
+    fn spawn(&self, _runner: &RunnerRecord, _target: &LaunchTarget) -> Result<ProcessIdentity, String> {
         Err("no runner can be launched in this version".into())
     }
 

@@ -219,6 +219,11 @@ pub struct MachineStatus {
     pub mode: Mode,
     pub admission: Admission,
     pub max_concurrent_tasks: u32,
+    /// What the service actually applies: `max_concurrent_tasks`, or 1 while Nestor does not
+    /// announce `capabilities.scope_filter` (KCA-734 §3).
+    pub effective_max_concurrent_tasks: u32,
+    /// The requested value is above what Nestor allows for now (shown as "limited by the server").
+    pub capped_by_server: bool,
     /// Upper bound accepted for `max_concurrent_tasks`; a sanity check on the input, not a limit
     /// on any runner's resources.
     pub max_concurrent_tasks_upper_bound: u32,
@@ -265,6 +270,10 @@ pub enum TaskOutcome {
     Stopped,
     /// The runner was adopted after a restart and ended without the service knowing how.
     Unknown,
+    /// The runner lost its lease (fencing): it stopped the job without finishing it.
+    LeaseLost,
+    /// The runner gave the job back to Nestor without running it (`scope_mismatch`).
+    Released,
 }
 
 /// How a runner process ended, as its launcher reports it.
@@ -278,6 +287,13 @@ pub enum RunnerExit {
     Vanished,
     /// Anything else: a crash, a launch failure, a signal nobody sent.
     Crashed(String),
+    /// Exit 64: the launch itself is wrong (a bug). Left `failed`, never launched again.
+    Usage,
+    /// Exit 75: Nestor could not be reached. Launched again after the backoff, not a crash.
+    Unreachable,
+    /// Exit 77: Nestor refused the credential (machine revoked). Left `failed`, no relaunch,
+    /// and no runner is launched until the connection changes.
+    Revoked,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

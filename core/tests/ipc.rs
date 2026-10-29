@@ -243,7 +243,7 @@ fn error_messages_are_masked() {
 
 /// A copy of Apple's `nc`, re-signed ad hoc, as a client whose signature can be checked.
 #[cfg(target_os = "macos")]
-fn signed_client(dir: &Path, name: &str, runtime: bool, get_task_allow: bool) -> (PathBuf, String) {
+fn signed_client(dir: &Path, name: &str, runtime: bool, entitlement: Option<&str>) -> (PathBuf, String) {
     let path = dir.join(name);
     fs::copy("/usr/bin/nc", &path).unwrap();
     let mut command = Command::new("/usr/bin/codesign");
@@ -251,11 +251,13 @@ fn signed_client(dir: &Path, name: &str, runtime: bool, get_task_allow: bool) ->
     if runtime {
         command.args(["--options", "runtime"]);
     }
-    if get_task_allow {
+    if let Some(entitlement) = entitlement {
         let entitlements = dir.join(format!("{name}.plist"));
         fs::write(
             &entitlements,
-            r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.security.get-task-allow</key><true/></dict></plist>"#,
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>{entitlement}</key><true/></dict></plist>"#
+            ),
         )
         .unwrap();
         command.arg("--entitlements").arg(&entitlements);
@@ -284,10 +286,13 @@ fn hello_from(client: &Path, socket: &Path) -> Value {
 #[test]
 fn clients_are_identified_by_code_signature_from_the_audit_token() {
     let dir = private_dir();
-    let (app, app_requirement) = signed_client(dir.path(), "app-client", true, false);
-    let (cli, cli_requirement) = signed_client(dir.path(), "cli-client", true, false);
-    let (debuggable, debuggable_requirement) = signed_client(dir.path(), "debuggable-client", true, true);
-    let (no_runtime, no_runtime_requirement) = signed_client(dir.path(), "plain-client", false, false);
+    let (app, app_requirement) = signed_client(dir.path(), "app-client", true, None);
+    let (cli, cli_requirement) = signed_client(dir.path(), "cli-client", true, None);
+    let (debuggable, debuggable_requirement) =
+        signed_client(dir.path(), "debuggable-client", true, Some("com.apple.security.get-task-allow"));
+    let (no_runtime, no_runtime_requirement) = signed_client(dir.path(), "plain-client", false, None);
+    let (exception, exception_requirement) =
+        signed_client(dir.path(), "exception-client", true, Some("com.apple.security.cs.disable-library-validation"));
 
     let policy = |app: &str, cli: &str| PeerPolicy {
         app_requirement: Some(app.to_string()),
@@ -307,4 +312,52 @@ fn clients_are_identified_by_code_signature_from_the_audit_token() {
     let running = start(ServiceMode::Demo, policy(&debuggable_requirement, &no_runtime_requirement));
     assert_eq!(hello_from(&debuggable, &running.socket)["result"]["access"], "basic");
     assert_eq!(hello_from(&no_runtime, &running.socket)["result"]["access"], "basic");
+
+    // Nor with a hardened runtime exception (F1): code could be loaded into it.
+    let running = start(ServiceMode::Demo, policy(&exception_requirement, &cli_requirement));
+    assert_eq!(hello_from(&exception, &running.socket)["result"]["access"], "basic");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_ad_hoc_signature_does_not_meet_the_developer_id_requirement() {
+    let dir = private_dir();
+    let (app, _) = signed_client(dir.path(), "fr.kocoa.nestor.runner-manager", true, None);
+    let policy = PeerPolicy {
+        app_requirement: Some(ipc::developer_id_requirement("fr.kocoa.nestor.runner-manager", "TEAMID1234")),
+        cli_requirement: None,
+        allow_unsigned_clients: false,
+    };
+    let running = start(ServiceMode::Demo, policy);
+    let answer = hello_from(&app, &running.socket);
+    assert_eq!(answer["result"]["access"], "basic", "the requirement compiles and an ad hoc copy fails it: {answer}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn basic_clients_cannot_keep_the_app_out() {
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant};
+
+    let dir = private_dir();
+    let (app, app_requirement) = signed_client(dir.path(), "app-client", true, None);
+    let policy =
+        PeerPolicy { app_requirement: Some(app_requirement), cli_requirement: None, allow_unsigned_clients: false };
+    let running = start(ServiceMode::Demo, policy);
+    // The test process is unsigned: basic. Eight of them hold every place open to basic peers.
+    let idle: Vec<UnixStream> =
+        (0..ipc::MAX_CONNECTIONS - ipc::RESERVED_FOR_FULL).map(|_| ipc::connect(&running.socket).unwrap()).collect();
+    assert_eq!(call(&running.socket, "hello", json!({}))["error"]["message"], "Too many clients.");
+    // The app still gets in.
+    let answer = hello_from(&app, &running.socket);
+    assert_eq!(answer["result"]["access"], "full", "{answer}");
+
+    // A connection that sends nothing is closed after 10 s, which frees its place.
+    let start = Instant::now();
+    let mut first = idle.into_iter().next().unwrap();
+    first.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let mut buffer = [0u8; 1];
+    assert_eq!(std::io::Read::read(&mut first, &mut buffer).unwrap_or(0), 0, "closed by the service");
+    let waited = start.elapsed();
+    assert!(waited >= Duration::from_secs(8) && waited < Duration::from_secs(15), "{waited:?}");
 }

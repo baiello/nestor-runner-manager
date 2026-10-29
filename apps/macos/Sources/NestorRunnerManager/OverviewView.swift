@@ -254,7 +254,7 @@ struct TasksControls: View {
 
         LabeledContent("Tasks at a time") {
             HStack(spacing: 8) {
-                Text("\(status.busyRunners) running of \(status.maxConcurrentTasks)")
+                Text("\(status.busyRunners) running of \(status.effectiveMaxConcurrentTasks)")
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
                 Stepper(
@@ -284,6 +284,15 @@ struct TasksControls: View {
             }
         }
 
+        if status.cappedByServer {
+            Label(
+                "Limited by the server to \(status.effectiveMaxConcurrentTasks) at a time for now: running tasks side by side needs Nestor to keep workspaces apart. Your setting of \(status.maxConcurrentTasks) applies once it does.",
+                systemImage: "lock.circle"
+            )
+            .font(.callout)
+            .foregroundStyle(.orange)
+            .fixedSize(horizontal: false, vertical: true)
+        }
         Text("This is how many tasks the machine accepts at the same time — not a processor or memory limit. Pausing or lowering it never stops a running task: it only holds back new ones. The service starts and stops runners to match.")
             .font(.callout)
             .foregroundStyle(.secondary)
