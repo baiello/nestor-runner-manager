@@ -29,6 +29,7 @@ enum Snapshots {
             ("07-not-associated", AnyView(ContentView(model: loadedModel(.notAssociated))), tall),
             ("08-service-unavailable", AnyView(ContentView(model: loadedModel(.unavailable))), size),
             ("09-loading", AnyView(ContentView(model: RunnerManagerModel(service: DemoRunnerService(latency: .seconds(3600))))), size),
+            ("12-associating", AnyView(ContentView(model: loadedModel(.associating))), tall),
         ]
 
         for (name, view, size) in scenes {

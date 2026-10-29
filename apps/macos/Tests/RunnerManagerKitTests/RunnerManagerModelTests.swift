@@ -74,7 +74,16 @@ import Testing
     @Test func loadsTheMachineStatusAndChangesSettings() async throws {
         let model = await loadedModel()
         #expect(model.status.value?.maxConcurrentTasks == 1)
-        await model.setMaxConcurrentTasks(2)
+        // Raising waits for the user's confirmation; nothing changes before it.
+        await model.requestMaxConcurrentTasks(3)
+        #expect(model.pendingCeilingRaise == 3)
+        #expect(model.status.value?.maxConcurrentTasks == 1)
+        await model.confirmCeilingRaise()
+        #expect(model.pendingCeilingRaise == nil)
+        #expect(model.status.value?.maxConcurrentTasks == 3)
+        // Lowering applies at once: it interrupts nothing.
+        await model.requestMaxConcurrentTasks(2)
+        #expect(model.pendingCeilingRaise == nil)
         #expect(model.status.value?.maxConcurrentTasks == 2)
         await model.setMode(.paused)
         #expect(model.status.value?.admission == .paused)
@@ -88,11 +97,22 @@ import Testing
         let model = RunnerManagerModel(service: service)
         await model.load()
         // Another client changes the settings meanwhile.
-        _ = try await service.setMaxConcurrentTasks(4, expectedRevision: 0)
+        _ = try await service.setMaxConcurrentTasks(4, expectedRevision: 0, confirmed: true)
         await model.setMode(.paused)
         #expect(model.actionError?.contains("changed elsewhere") == true)
         #expect(model.status.value?.maxConcurrentTasks == 4)
         #expect(model.status.value?.mode == .automatic)
+    }
+
+    @Test func disassociatingEndsTheAssociationAfterConfirmation() async throws {
+        let model = await loadedModel()
+        #expect(model.isAssociated)
+        #expect(model.access == .demo)
+        #expect(model.canChange)
+        await model.disassociate()
+        #expect(model.connection == .loaded(.notAssociated))
+        #expect(model.runners.value?.isEmpty == true)
+        #expect(model.status.value?.admission == .blocked(.notAssociated))
     }
 
     @Test func demoBannerFollowsTheServiceReport() async {

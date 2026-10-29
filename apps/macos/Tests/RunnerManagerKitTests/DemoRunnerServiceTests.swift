@@ -105,7 +105,10 @@ import Testing
 
     @Test func pauseAndLowerCeilingKeepRunningTasks() async throws {
         let demo = service()
-        var status = try await demo.setMaxConcurrentTasks(3, expectedRevision: 0)
+        await #expect(throws: RunnerServiceError.self) {
+            try await demo.setMaxConcurrentTasks(3, expectedRevision: 0)
+        }
+        var status = try await demo.setMaxConcurrentTasks(3, expectedRevision: 0, confirmed: true)
         #expect(status.maxConcurrentTasks == 3)
         status = try await demo.setMode(.paused, expectedRevision: status.configRevision)
         #expect(status.admission == .paused)
@@ -125,7 +128,7 @@ import Testing
             try await demo.setMaxConcurrentTasks(0, expectedRevision: 1)
         }
         await #expect(throws: RunnerServiceError.limitOutOfRange(min: 1, max: 24)) {
-            try await demo.setMaxConcurrentTasks(25, expectedRevision: 1)
+            try await demo.setMaxConcurrentTasks(25, expectedRevision: 1, confirmed: true)
         }
     }
 

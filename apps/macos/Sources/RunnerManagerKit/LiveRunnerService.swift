@@ -6,12 +6,17 @@ import Foundation
 ///
 /// Whether the data is real is decided by the service, not by this client: the service reports
 /// `serviceMode` on every machine status, and a service started with `--simulate` reports `demo`.
+///
+/// Before sending anything, the client checks with the kernel that the process serving the
+/// socket runs as the same user: a service of another user (or a fake one announcing `live`)
+/// is refused. What the app may do is decided by the service from the app's code signature
+/// (`access()`).
 public final class LiveRunnerService: RunnerService {
     public let mode: ServiceMode = .live
     public let socketPath: String
     private let timeout: TimeInterval
 
-    public static let apiVersion = "1.0"
+    public static let apiVersion = "1.1"
 
     /// The socket of a live service started with its default settings.
     public static var defaultSocketPath: String {
@@ -26,6 +31,10 @@ public final class LiveRunnerService: RunnerService {
     }
 
     // MARK: RunnerService
+
+    public func access() async throws -> ServiceAccess {
+        try await call("hello", as: Wire.Hello.self).model
+    }
 
     public func machineInfo() async throws -> MachineInfo {
         let info = try await call("machineInfo", as: Wire.MachineInfo.self)
@@ -48,6 +57,15 @@ public final class LiveRunnerService: RunnerService {
         try await call("associate", as: Wire.Connection.self).model
     }
 
+    public func cancelAssociation() async throws -> NestorConnection {
+        try await call("cancelAssociation", as: Wire.Connection.self).model
+    }
+
+    public func disassociate() async throws -> NestorConnection {
+        // The interface asked the user first: running tasks end.
+        try await call("disassociate", ["confirmed": true], as: Wire.Connection.self).model
+    }
+
     public func machineStatus() async throws -> MachineStatus {
         try await call("machineStatus", as: Wire.Status.self).model
     }
@@ -56,10 +74,10 @@ public final class LiveRunnerService: RunnerService {
         try await call("setMode", ["mode": mode.rawValue, "expectedRevision": expectedRevision], as: Wire.Status.self).model
     }
 
-    public func setMaxConcurrentTasks(_ value: Int, expectedRevision: Int) async throws -> MachineStatus {
+    public func setMaxConcurrentTasks(_ value: Int, expectedRevision: Int, confirmed: Bool) async throws -> MachineStatus {
         try await call(
             "setMaxConcurrentTasks",
-            ["value": value, "expectedRevision": expectedRevision],
+            ["value": value, "expectedRevision": expectedRevision, "confirmed": confirmed],
             as: Wire.Status.self
         ).model
     }
@@ -70,7 +88,12 @@ public final class LiveRunnerService: RunnerService {
 
     public func addRunner(_ request: NewRunnerRequest) async throws -> Runner {
         _ = try RunnerNameRule.validate(request.name)
-        return try await call("addRunner", ["name": request.name, "startNow": request.startNow], as: Wire.Runner.self).model
+        // The add sheet, an advanced action with its own explanation, is the confirmation.
+        return try await call(
+            "addRunner",
+            ["name": request.name, "startNow": request.startNow, "confirmed": true],
+            as: Wire.Runner.self
+        ).model
     }
 
     public func start(runnerID: Runner.ID) async throws -> Runner {
@@ -78,7 +101,12 @@ public final class LiveRunnerService: RunnerService {
     }
 
     public func stop(runnerID: Runner.ID, force: Bool) async throws -> Runner {
-        try await call("stop", ["runnerId": Wire.serviceID(runnerID), "force": force], as: Wire.Runner.self).model
+        // A forced stop is only sent after the interface's confirmation.
+        try await call(
+            "stop",
+            ["runnerId": Wire.serviceID(runnerID), "force": force, "confirmed": force],
+            as: Wire.Runner.self
+        ).model
     }
 
     public func remove(runnerID: Runner.ID) async throws {
@@ -149,6 +177,12 @@ public final class LiveRunnerService: RunnerService {
         guard connected == 0 else {
             throw RunnerServiceError.unavailable("the runner service is not running (no answer on \(socketPath)).")
         }
+        // Only talk to a service of our own user.
+        var peerUser: uid_t = 0
+        var peerGroup: gid_t = 0
+        guard getpeereid(descriptor, &peerUser, &peerGroup) == 0, peerUser == geteuid() else {
+            throw RunnerServiceError.unavailable("the process serving \(socketPath) runs as another user; it was not used.")
+        }
 
         var payload = request
         payload.append(0x0A)
@@ -209,6 +243,7 @@ enum Wire {
             case "invalidArgument": .invalidArgument(message)
             case "permissionDenied": .permissionDenied
             case "incompatibleVersion": .incompatibleVersion(details?["supported"]?.string ?? "?")
+            case "confirmationRequired": .confirmationRequired(message)
             default: .unavailable(message)
             }
         }
@@ -255,14 +290,36 @@ enum Wire {
         var diskFreeBytes: UInt64
     }
 
+    struct Hello: Decodable {
+        var access: String?
+        var peerVerification: String?
+
+        var model: ServiceAccess {
+            ServiceAccess(
+                level: access.flatMap(ServiceAccess.Level.init(rawValue:)) ?? .basic,
+                verification: peerVerification.flatMap(ServiceAccess.Verification.init(rawValue:)) ?? .none
+            )
+        }
+    }
+
     struct Connection: Decodable {
         var state: String
         var instance: String?
         var sinceMs: UInt64?
         var reason: String?
+        var userCode: String?
+        var verificationUri: String?
+        var expiresAtMs: UInt64?
 
         var model: NestorConnection {
             switch state {
+            case "associating":
+                .associating(
+                    instance: instance ?? "?",
+                    userCode: userCode ?? "",
+                    verificationURL: verificationUri ?? "",
+                    expiresAt: Wire.date(expiresAtMs ?? 0)
+                )
             case "associated": .associated(instance: instance ?? "?", since: Wire.date(sinceMs ?? 0))
             case "unreachable": .unreachable(instance: instance ?? "?", reason: reason ?? "")
             case "revoked": .revoked

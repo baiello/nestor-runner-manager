@@ -16,6 +16,7 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             if model.isDemo { DemoBanner() }
+            if let access = model.access, let banner = AccessBanner(access: access) { banner }
             NavigationSplitView {
                 Sidebar(model: model, selection: $selection)
                     .navigationSplitViewColumnWidth(min: 220, ideal: 240)
@@ -122,6 +123,41 @@ struct Sidebar: View {
 }
 
 /// Shown on every screen while the service is simulated, so no simulated command passes for a real one.
+/// Shown when the service does not give this app full access, or gives it only because it was
+/// started for development with unsigned clients allowed.
+struct AccessBanner: View {
+    let text: String
+    let isWarning: Bool
+
+    init?(access: ServiceAccess) {
+        switch (access.level, access.verification) {
+        case (.full, .unsignedFallback):
+            text = "Development: the runner service accepts unsigned apps (--allow-unsigned-clients). Do not use it for real work."
+            isWarning = true
+        case (.full, _):
+            return nil
+        case (.readOnly, _), (.basic, _):
+            text = "Read only: the runner service could not verify this app's signature, so it shows the status but refuses changes."
+            isWarning = false
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: isWarning ? "exclamationmark.triangle.fill" : "lock.fill")
+            Text(text).lineLimit(2)
+            Spacer(minLength: 0)
+        }
+        .font(.callout)
+        .foregroundStyle(isWarning ? Color.black : Color.primary)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 7)
+        .frame(maxWidth: .infinity)
+        .background(isWarning ? Color.orange : Color.secondary.opacity(0.15))
+        .accessibilityElement(children: .combine)
+    }
+}
+
 struct DemoBanner: View {
     var body: some View {
         HStack(spacing: 8) {

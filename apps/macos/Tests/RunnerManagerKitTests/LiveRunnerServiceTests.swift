@@ -59,6 +59,34 @@ import Testing
         #expect(throws: expected) { try LiveRunnerService.decode(reply, as: Wire.Status.self) }
     }
 
+    @Test func decodesAnAssociationInProgressAndTheAccessLevel() throws {
+        let reply = data("""
+        {"ok":true,"result":{"state":"associating","instance":"nestor.example","userCode":"WDJB-MJHT","verificationUri":"https://nestor.example/machines/approve","expiresAtMs":1793291600000}}
+        """)
+        let connection = try LiveRunnerService.decode(reply, as: Wire.Connection.self).model
+        #expect(connection == .associating(
+            instance: "nestor.example",
+            userCode: "WDJB-MJHT",
+            verificationURL: "https://nestor.example/machines/approve",
+            expiresAt: Wire.date(1_793_291_600_000)
+        ))
+        let hello = data(#"{"ok":true,"result":{"apiVersion":"1.1","serviceMode":"live","access":"readOnly","peerVerification":"signature"}}"#)
+        #expect(try LiveRunnerService.decode(hello, as: Wire.Hello.self).model == ServiceAccess(level: .readOnly, verification: .signature))
+        // An older service without these fields: the least access.
+        let old = data(#"{"ok":true,"result":{"apiVersion":"1.0","serviceMode":"live"}}"#)
+        #expect(try LiveRunnerService.decode(old, as: Wire.Hello.self).model.level == .basic)
+        let confirm = data(#"{"ok":false,"error":{"code":"confirmationRequired","message":"Confirm first: x","retryable":false}}"#)
+        #expect(throws: RunnerServiceError.confirmationRequired("Confirm first: x")) {
+            try LiveRunnerService.decode(confirm, as: Wire.Status.self)
+        }
+    }
+
+    @Test func runnerNamesAreASCII() {
+        #expect(throws: RunnerServiceError.self) { try RunnerNameRule.validate("caf\u{e9}") }
+        #expect(throws: RunnerServiceError.self) { try RunnerNameRule.validate("runner\u{2010}1") }
+        #expect((try? RunnerNameRule.validate(" studio-ci_2.1 ")) == "studio-ci_2.1")
+    }
+
     @Test func unreachableServiceIsUnavailable() async {
         let service = LiveRunnerService(socketPath: "/nonexistent/service.sock", timeout: 1)
         await #expect(throws: RunnerServiceError.self) { try await service.machineStatus() }

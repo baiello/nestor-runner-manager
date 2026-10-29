@@ -35,6 +35,9 @@ public struct MachineInfo: Equatable, Sendable {
 /// Workspaces are assigned to runners on the Nestor web app, never here.
 public enum NestorConnection: Equatable, Sendable {
     case notAssociated
+    /// Waiting for an administrator to approve this machine on the Nestor web app with
+    /// `userCode`. The code alone grants nothing; nothing secret is shown or typed here.
+    case associating(instance: String, userCode: String, verificationURL: String, expiresAt: Date)
     case associated(instance: String, since: Date)
     case unreachable(instance: String, reason: String)
     /// The association was revoked in Nestor; associate again to take tasks.
@@ -260,4 +263,39 @@ public struct MachineStatus: Equatable, Sendable {
         self.load = load
         self.configError = configError
     }
+}
+
+// MARK: Access to the service
+
+/// What the local service lets this app do, decided by the service from the app's code
+/// signature (docs/local-api.md, "Who may do what").
+public struct ServiceAccess: Equatable, Sendable {
+    public enum Level: String, Equatable, Sendable {
+        /// Read and change everything: the signed app.
+        case full
+        /// Read only, without runner logs: the signed command line tool.
+        case readOnly
+        /// Status only: an app the service could not verify.
+        case basic
+    }
+
+    public enum Verification: String, Equatable, Sendable {
+        /// The service checked the app's code signature.
+        case signature
+        /// Not verified; the service was started with `--allow-unsigned-clients` (development).
+        case unsignedFallback
+        case none
+        /// The in-app demo: there is no service.
+        case notApplicable
+    }
+
+    public var level: Level
+    public var verification: Verification
+
+    public init(level: Level, verification: Verification) {
+        self.level = level
+        self.verification = verification
+    }
+
+    public static let demo = ServiceAccess(level: .full, verification: .notApplicable)
 }

@@ -7,6 +7,7 @@ import SwiftUI
 struct OverviewView: View {
     var model: RunnerManagerModel
     @Binding var selection: SidebarItem?
+    @State private var isConfirmingDisassociation = false
 
     var body: some View {
         ScrollView {
@@ -39,9 +40,32 @@ struct OverviewView: View {
                     .foregroundStyle(.green)
                 InfoRow(label: "Instance", value: instance)
                 InfoRow(label: "Since", value: Format.relative(since))
-                Text("Workspaces are assigned to this machine's runners on the Nestor web app, not here.")
+                Text("Workspaces are assigned to this machine on the Nestor web app, not here.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
+                disassociateButton
+            case .loaded(.associating(let instance, let userCode, let verificationURL, let expiresAt)):
+                Label("Waiting for approval", systemImage: "hourglass").foregroundStyle(.orange)
+                Text("An administrator approves this Mac on Nestor with this code:")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Text(userCode)
+                    .font(.system(.title, design: .monospaced).bold())
+                    .textSelection(.enabled)
+                    .accessibilityLabel("Approval code \(userCode)")
+                InfoRow(label: "Instance", value: instance)
+                InfoRow(label: "Expires", value: Format.relative(expiresAt))
+                HStack {
+                    if let url = URL(string: verificationURL), url.scheme == "https" {
+                        Link("Open Nestor", destination: url)
+                    }
+                    Button("Cancel") { Task { await model.cancelAssociation() } }
+                        .disabled(!model.canChange)
+                }
+                Text("The code alone gives no access: the approval needs an administrator signed in to Nestor. Nothing secret is shown or typed here.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             case .loaded(.unreachable(let instance, let reason)):
                 Label("Unreachable", systemImage: "wifi.exclamationmark").foregroundStyle(.orange)
                 InfoRow(label: "Instance", value: instance)
@@ -57,13 +81,28 @@ struct OverviewView: View {
                 associateButton
             case .loaded(.notAssociated):
                 Label("Not associated", systemImage: "link.badge.plus").foregroundStyle(.secondary)
-                Text("Associate this machine once; the service then manages its runners and Nestor gives each one its own identity. You will confirm the association in your browser — no password or token is typed here.")
+                Text("Associate this machine once; the service then manages its runners and Nestor gives each one its own identity. An administrator approves it on Nestor with a code shown here — no password or token is typed here.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 associateButton
             }
         }
+    }
+
+    private var disassociateButton: some View {
+        Button("Disassociate…", role: .destructive) { isConfirmingDisassociation = true }
+            .disabled(!model.canChange)
+            .confirmationDialog(
+                "Disassociate this Mac from Nestor?",
+                isPresented: $isConfirmingDisassociation
+            ) {
+                Button("Disassociate and End Running Tasks", role: .destructive) {
+                    Task { await model.disassociate() }
+                }
+            } message: {
+                Text("The tasks running on this Mac end now, and its credentials are erased, even if Nestor cannot be reached. Associate it again to take tasks.")
+            }
     }
 
     private var associateButton: some View {
@@ -73,7 +112,7 @@ struct OverviewView: View {
                     Task { await model.associate() }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(model.isAssociating)
+                .disabled(model.isAssociating || !model.canChange)
                 if model.isAssociating { ProgressView().controlSize(.small) }
             }
             if model.isDemo {
@@ -210,7 +249,7 @@ struct TasksControls: View {
             .pickerStyle(.segmented)
             .labelsHidden()
             .frame(width: 220)
-            .disabled(model.isUpdatingSettings)
+            .disabled(model.isUpdatingSettings || !model.canChange)
         }
 
         LabeledContent("Tasks at a time") {
@@ -222,13 +261,25 @@ struct TasksControls: View {
                     "\(status.maxConcurrentTasks)",
                     value: Binding(
                         get: { status.maxConcurrentTasks },
-                        set: { value in Task { await model.setMaxConcurrentTasks(value) } }
+                        set: { value in Task { await model.requestMaxConcurrentTasks(value) } }
                     ),
                     in: 1...max(1, status.maxConcurrentTasksUpperBound)
                 )
                 .monospacedDigit()
-                .disabled(model.isUpdatingSettings)
+                .disabled(model.isUpdatingSettings || !model.canChange)
                 .accessibilityLabel("Tasks at a time")
+                .confirmationDialog(
+                    "Run more tasks at the same time?",
+                    isPresented: Binding(
+                        get: { model.pendingCeilingRaise != nil },
+                        set: { if !$0 { model.pendingCeilingRaise = nil } }
+                    ),
+                    presenting: model.pendingCeilingRaise
+                ) { value in
+                    Button("Allow \(value) Tasks at a Time") { Task { await model.confirmCeilingRaise() } }
+                } message: { value in
+                    Text("Up to \(value) tasks will run side by side on this Mac, always from the same workspace. Lowering it again never stops a running task.")
+                }
                 .accessibilityValue("\(status.maxConcurrentTasks)")
             }
         }
