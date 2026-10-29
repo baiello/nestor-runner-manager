@@ -73,3 +73,39 @@ jobs:
         run: |
           ../scripts/sign-macos.sh --identity - --kind service --identifier fr.kocoa.nestor.runner-service \
             target/release/nestor-runner-service
+
+  # R2 of KCA-734 §5: the service launches the real `nestor-runner run-once`, built from nestor at
+  # the commit pinned in contract/nestor.rev. nestor is private: the build reads it with the
+  # read-only secret NESTOR_READ_TOKEN. Without the secret and without a cached build, the job
+  # fails: it never falls back to the double.
+  contract:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: core
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pinned nestor commit
+        id: nestor
+        run: echo "rev=$(tr -d ' \n' < ../contract/nestor.rev)" >> "$GITHUB_OUTPUT"
+      - name: The real runner, cached by commit
+        uses: actions/cache@v4
+        with:
+          path: |
+            core/target/nestor-runner/${{ steps.nestor.outputs.rev }}/nestor-runner
+            core/target/nestor-runner/${{ steps.nestor.outputs.rev }}/run-once-v1.json
+            core/target/nestor-runner/${{ steps.nestor.outputs.rev }}/rev
+          key: nestor-runner-${{ runner.os }}-${{ steps.nestor.outputs.rev }}
+      - name: Build the real runner
+        env:
+          NESTOR_READ_TOKEN: ${{ secrets.NESTOR_READ_TOKEN }}
+          REV: ${{ steps.nestor.outputs.rev }}
+        run: |
+          if [ -z "$NESTOR_READ_TOKEN" ] && [ ! -x "target/nestor-runner/$REV/nestor-runner" ]; then
+            echo "::error::NESTOR_READ_TOKEN is not set: the contract test cannot build nestor-runner at $REV"
+            exit 1
+          fi
+          echo "NESTOR_RUNNER_DIR=$(../scripts/nestor-runner.sh)" >> "$GITHUB_ENV"
+      - name: Contract test with the real runner
+        run: cargo test --locked --test contract_run_once -- --include-ignored

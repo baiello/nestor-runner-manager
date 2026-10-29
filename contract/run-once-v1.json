@@ -39,7 +39,7 @@
     "deny_unknown_fields": true,
     "valid": [
       { "runner_token": "nestor_runner_example_credential_0000" },
-      { "runner_token": "nestor_runner_example_credential_0000", "claude_code_token": "example-claude-code-token-0000" }
+      { "runner_token": "nestor_runner_example_credential_0000", "claude_code_token": "sk-ant-oat01-example-claude-code-token-0000" }
     ],
     "invalid": [
       "nestor_runner_example_credential_0000",

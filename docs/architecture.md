@@ -57,6 +57,6 @@ Nestor Runner Manager has native interfaces per operating system on top of one s
 
 ## Not in this version
 
-- The Nestor API for machines (S1 to S6): until it exists, the live service has no `NestorApi`, answers `unavailable` to `associate` and launches nothing. The runner's one-job mode exists (`nestor-runner run-once`, S7); the launcher follows its contract v1 and is tested against a double that checks the vendored fixtures. The cross-repository test against the real binary is R2 (KCA-737).
+- The Nestor API for machines (S1 to S6): until it exists, the live service has no `NestorApi`, answers `unavailable` to `associate` and launches nothing. The runner's one-job mode exists (`nestor-runner run-once`, S7); the launcher follows its contract v1, is tested against a double that checks the vendored fixtures, and against the real binary built at the nestor commit pinned in `contract/nestor.rev` (`core/tests/contract_run_once.rs`, R2 of KCA-737, the `contract` job of the CI).
 - Signing (A6): the Secure Enclave key, the Keychain and the verification of the app by the service need it. Start at login (LaunchAgent), notarization, installation on the Mac Studio — not authorized in this lot (contract §6.B, see security.md).
 - Load-driven admission (CPU, memory pressure): after real measurements on the Mac Studio (KCA-717 §9).

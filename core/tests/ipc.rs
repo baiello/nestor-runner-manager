@@ -345,6 +345,9 @@ fn basic_clients_cannot_keep_the_app_out() {
         PeerPolicy { app_requirement: Some(app_requirement), cli_requirement: None, allow_unsigned_clients: false };
     let running = start(ServiceMode::Demo, policy);
     // The test process is unsigned: basic. Eight of them hold every place open to basic peers.
+    // The service gives each 10 s from its opening: timed from there, not from after the app's
+    // own connection, which takes seconds to check (KCA-737).
+    let opened = Instant::now();
     let idle: Vec<UnixStream> =
         (0..ipc::MAX_CONNECTIONS - ipc::RESERVED_FOR_FULL).map(|_| ipc::connect(&running.socket).unwrap()).collect();
     assert_eq!(call(&running.socket, "hello", json!({}))["error"]["message"], "Too many clients.");
@@ -352,12 +355,11 @@ fn basic_clients_cannot_keep_the_app_out() {
     let answer = hello_from(&app, &running.socket);
     assert_eq!(answer["result"]["access"], "full", "{answer}");
 
-    // A connection that sends nothing is closed after 10 s, which frees its place.
-    let start = Instant::now();
+    // A connection that sends nothing is closed 10 s after it opened, which frees its place.
     let mut first = idle.into_iter().next().unwrap();
     first.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
     let mut buffer = [0u8; 1];
     assert_eq!(std::io::Read::read(&mut first, &mut buffer).unwrap_or(0), 0, "closed by the service");
-    let waited = start.elapsed();
-    assert!(waited >= Duration::from_secs(8) && waited < Duration::from_secs(15), "{waited:?}");
+    let waited = opened.elapsed();
+    assert!(waited >= Duration::from_secs(9) && waited < Duration::from_secs(15), "{waited:?}");
 }
