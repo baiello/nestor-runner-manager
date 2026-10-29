@@ -103,11 +103,18 @@ swift build
 swift test -Xswiftc -load-plugin-library -Xswiftc /Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing/libTestingMacros.dylib
 ```
 
-## Continuous integration
+## Local verification
 
-`.github/workflows/macos.yml` builds, tests and makes an arm64 release build of the app, and tests and lints `core/`, on GitHub's macOS runner for each pull request and each push to `main`. Both jobs also sign their binary ad hoc with `scripts/sign-macos.sh` to check the signing configuration (hardened runtime, no `get-task-allow`). GitHub-hosted runners are free for public repositories.
+The checks run on the developer's Mac, by hand, before a push: `scripts/verify-local.sh` builds, tests and makes an arm64 release build of the app, formats, tests and lints `core/`, checks that a release build of the service refuses the development-only unsigned fallback (M1), and signs both binaries ad hoc with `scripts/sign-macos.sh` to check the signing configuration (hardened runtime, no `get-task-allow`). It installs nothing and needs no certificate nor privilege. Every pull request carries its result on its head commit: the command, the commit and the outcome.
 
-The contract test with the real `nestor-runner run-once` (`core/tests/contract_run_once.rs`) does not run here: nestor is private, and this public repository holds no secret to read it. nestor's CI runs it instead, on each pull request of nestor that touches `apps/runner/**`, `docs/run-once-contract.md` or `contract/**`: it builds the runner of that pull request, clones this repository without a token at the commit nestor pins in `contract/runner-manager.rev`, and runs the test with `NESTOR_RUNNER_UNPINNED=1`. A change of the contract therefore lands here first (fixtures and `contract/nestor.rev`, test passed locally), then nestor pins that commit. See [contract/README.md](contract/README.md).
+```sh
+scripts/verify-local.sh               # app and core
+scripts/verify-local.sh --contract    # also the contract test with the real nestor-runner run-once
+```
+
+The contract test with the real `nestor-runner run-once` (`core/tests/contract_run_once.rs`) needs read access to nestor, which is private: `--contract` builds the runner with `scripts/nestor-runner.sh` (git's own credentials, or a local clone in `NESTOR_SOURCE`). nestor runs the same test from its side by hand, with `make contract-check`, against the commit of this repository it pins in `contract/runner-manager.rev`. See [contract/README.md](contract/README.md).
+
+`.github/workflows/macos.yml`, which predates the local service, builds and tests the app only; no check of `core/` and no signing step runs on GitHub.
 
 ## Next steps
 

@@ -10,18 +10,17 @@
 
 ## Where the contract test runs
 
-nestor is private and this repository is public: no CI of this repository reads nestor, and none asks for a token to do so. The contract test runs in **nestor's** CI instead (`.github/workflows/ci-contract.yml` there, KCA-750):
+nestor is private and this repository is public: nothing of this repository reads nestor, and nothing holds a token to do so. The contract test runs by hand, on a developer's Mac, from either side; no hosted CI runs it:
 
-1. A pull request of nestor that touches `apps/runner/**`, `docs/run-once-contract.md` or `contract/**` starts it.
-2. It builds `nestor-runner` from that pull request, then clones this repository, public, without a token, at the commit nestor pins in its `contract/runner-manager.rev`.
-3. It runs `core/tests/contract_run_once.rs` with `NESTOR_RUNNER_UNPINNED=1`: the runner is the pull request's, not the one of `nestor.rev`; the fixtures must still equal this copy byte for byte.
+- here, `scripts/verify-local.sh --contract` (or the command of `core/README.md`) builds the runner at `nestor.rev`, with the developer's own git credentials or a local clone of nestor in `NESTOR_SOURCE`;
+- in nestor, `make contract-check` (`ci/contract-check.sh` there) builds `nestor-runner` from the nestor checkout, clones this repository, public, without a token, at the commit nestor pins in its `contract/runner-manager.rev`, and runs `core/tests/contract_run_once.rs` with `NESTOR_RUNNER_UNPINNED=1`: the runner is the checkout's, not the one of `nestor.rev`; the fixtures must still equal this copy byte for byte.
 
-Here, `cargo test` ignores the test; a developer who can read nestor runs it locally (`core/README.md`).
+A plain `cargo test` ignores the test.
 
 Any change of the contract:
 
-1. in nestor, changes `contract` and the runner; its contract job then fails, the fixtures no longer being this copy;
+1. in nestor, changes `contract` and the runner; `make contract-check` then fails, the fixtures no longer being this copy;
 2. here, one pull request copies `contract/run-once-v1.json` unchanged, pins its commit in `nestor.rev`, adapts the service, and passes the contract test locally;
-3. in nestor, `contract/runner-manager.rev` pins that commit of this repository, and the contract job passes.
+3. in nestor, `contract/runner-manager.rev` pins that commit of this repository, and `make contract-check` passes.
 
 **Read ahead of the contract (A7, KCA-749).** The service also accepts, on a `finished` report of outcome `failed` only, a `failure` code (`[a-z_]{1,64}`), such as `claude_not_signed_in`, to show that Claude Code is not signed in on the machine. `run-once` at `nestor.rev` does not send it: it needs a change of the contract in nestor (fixtures and runner) before it shows anything with the real runner.

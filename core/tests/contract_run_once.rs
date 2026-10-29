@@ -13,8 +13,8 @@
 //! fall back to the double of `examples/run_once_double.rs`, and check that the process the
 //! service follows is that binary, at that commit, with nestor's fixtures equal to ours.
 //!
-//! nestor's CI runs them the other way round (`.github/workflows/ci-contract.yml` there): it
-//! builds the runner of its pull request, at a commit that is not pinned here, and sets
+//! nestor runs them the other way round, by hand (`make contract-check` there): it builds the
+//! runner of its checkout, at a commit that is not pinned here, and sets
 //! `NESTOR_RUNNER_UNPINNED=1`, which waives only the check of the commit; the fixtures must still
 //! be ours byte for byte.
 //!
@@ -82,8 +82,8 @@ fn real() -> Real {
         rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit()),
         "rev in NESTOR_RUNNER_DIR is not a commit: '{rev}'"
     );
-    // nestor's CI tests the runner of its own pull request against this service: the commit is
-    // then the pull request's, not the pinned one, and the fixtures must still be ours.
+    // nestor's `make contract-check` tests the runner of its checkout against this service: the
+    // commit is then the checkout's, not the pinned one, and the fixtures must still be ours.
     if std::env::var_os("NESTOR_RUNNER_UNPINNED").is_none_or(|v| v != "1") {
         let pinned = include_str!("../../contract/nestor.rev").trim();
         assert_eq!(rev, pinned, "the runner was built from nestor {rev}, not the pinned {pinned}");

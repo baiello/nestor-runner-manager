@@ -14,11 +14,10 @@
 #   and contract unchanged;
 # - otherwise a fetch of the pinned commit only from NESTOR_REPOSITORY (default
 #   https://github.com/baiello/nestor.git, a private repository), with git's own credentials:
-#   those of a developer who can read nestor. No CI of this repository runs it: nestor's CI runs
-#   the contract test instead (core/README.md).
+#   those of a developer who can read nestor. It runs by hand only (scripts/verify-local.sh
+#   --contract, core/README.md); no hosted CI runs it.
 #
-# An output directory whose `rev` already names the pinned commit is reused as it is (the CI
-# caches it by commit).
+# An output directory whose `rev` already names the pinned commit is reused as it is.
 set -eu
 
 here="$(cd "$(dirname "$0")/.." && pwd)"
