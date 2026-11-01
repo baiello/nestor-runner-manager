@@ -119,8 +119,8 @@ The contract test with the real `nestor-runner run-once` (`core/tests/contract_r
 ## Next steps
 
 1. Nestor API work (contract v2, S1 to S7): device authorization, machine credential and runner credentials, eligible count per scope, lease ceiling, pause and scope enforced at claim (S6), the runner's one-job mode (S7). Then an HTTP client behind `NestorApi` and the real runner behind `ProcessLauncher`, on a test Nestor first. Security review before any real integration.
-2. Signing with an Apple Developer certificate (A6, to be validated by Brice): it is required for the Secure Enclave key, the Keychain and the verification of the app by the service.
-3. Start at login (LaunchAgent, acceptable only with dedicated runner accounts B1(a) or an explicit acceptance, see docs/security.md), installation on the Mac Studio — each to be authorized first.
+2. Signing: no Apple Developer certificate nor notarization for now (Brice, 2026-11-01); the trials use ad hoc signatures. That leaves the Secure Enclave key, the Keychain and the verification of the app by Developer ID out of reach: the trials need the software key of A6 and a pinned app, Open 1 and Open 2 of [docs/launch-daemon.md](docs/launch-daemon.md), each to be decided and reviewed first.
+3. Start before login: a LaunchDaemon installed by Brice with `sudo`, under Brice's own account, binaries and plist owned by root (Brice, 2026-11-01; contract and procedure in [docs/launch-daemon.md](docs/launch-daemon.md)). The installation on the Mac Studio is still to be authorized.
 4. Admission driven by memory pressure and CPU, after real measurements on the Mac Studio.
 5. Windows and Linux clients on the same core.
 

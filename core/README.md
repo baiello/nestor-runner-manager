@@ -41,4 +41,4 @@ To move to a new contract or runner: pin the nestor commit in `contract/nestor.r
 
 Then, from `apps/macos`: `swift run NestorRunnerManager --service` (live) or `--socket "$HOME/Library/Application Support/Nestor Runner Manager/demo/run/service.sock"` (simulated).
 
-The service runs in your session and stops with it; nothing is installed. Start at login and the real runner come later.
+Run this way, the service runs in your session and stops with it; nothing is installed. Starting before login is a LaunchDaemon that Brice installs with `sudo`: see [../docs/launch-daemon.md](../docs/launch-daemon.md).

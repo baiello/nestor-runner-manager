@@ -96,9 +96,13 @@ Associated and confirmed, the service sends `POST /machine/heartbeat` at the int
 
 The Secure Enclave key and the Keychain access group need a **signed build** with a `keychain-access-groups` entitlement, so an Apple Developer certificate (a purchase, to be validated by Brice). An unsigned build gets an error (`errSecMissingEntitlement`, `-34018`, or `-25308` here) and the service reports it: **association is impossible until the signing is in place**. The weaker fallback of A6 — a software key kept in the Keychain — is coded behind the `MachineKeyStore` interface (`SoftwareKeyStore`, `KeyStoreWithFallback`) and **disabled**: the service binary never enables it, and enabling it is Brice's decision. Tested both ways in `secrets` unit tests and `tests/association.rs`.
 
+**Decision of 2026-11-01:** no certificate and no notarization for now; the trials are signed ad hoc. With the start before login (below), the Keychain is out of reach too until the account logs in: the trials need the software key and the credential out of the Keychain, in files of the data directory, readable by the account that runs the tasks. That is Open 1 of [launch-daemon.md](launch-daemon.md), with its risk and recommendation; it stays off until Brice accepts it and a security review of the file store.
+
 ## Preparing a real installation (contract §6.B), with the N3 correction
 
 Nothing of this is authorized or done in this lot.
+
+**Decision of 2026-11-01:** start before login, as a LaunchDaemon installed by Brice with `sudo`, running as Brice's own account, without a second account. Its contract is [launch-daemon.md](launch-daemon.md): the binaries and the plist are owned by root and not writable by the account (D3), which meets §6.B.2 with one account, where the LaunchAgent could not.
 
 - **§6.B.2 (unchanged):** the binary and the plist must not be modifiable by the account that runs the tasks. With a LaunchAgent under the user's own id, a task that escapes its confinement can modify them: acceptable only with B1(a) or an explicit acceptance.
 - **§6.B.3 (corrected, N3):** the LaunchAgent stays the first recommendation **only with B1(a)** (dedicated runner accounts, which cannot write the service's binary and plist) **or with Brice's explicit acceptance of that risk**. B1(b) does **not** make it acceptable: limiting concurrency to one scope protects neither the binary nor the plist. If B1(a) is chosen, a LaunchDaemon or a LaunchAgent of an account dedicated to the service is to be compared.
