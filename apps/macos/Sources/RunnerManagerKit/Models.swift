@@ -35,6 +35,13 @@ public struct MachineInfo: Equatable, Sendable {
 /// Workspaces are assigned to runners on the Nestor web app, never here.
 public enum NestorConnection: Equatable, Sendable {
     case notAssociated
+    /// Waiting for an administrator to approve this machine on the Nestor web app with
+    /// `userCode`. The code alone grants nothing; nothing secret is shown or typed here.
+    case associating(instance: String, userCode: String, verificationURL: String, expiresAt: Date)
+    /// Approved on Nestor for the account `accountEmail`, by `approvedByEmail`, both masked by
+    /// Nestor. Nothing runs until the owner confirms them here: someone who saw the code and
+    /// typed it first would otherwise get the machine (M1).
+    case confirming(instance: String, accountEmail: String, approvedByEmail: String)
     case associated(instance: String, since: Date)
     case unreachable(instance: String, reason: String)
     /// The association was revoked in Nestor; associate again to take tasks.
@@ -159,6 +166,19 @@ public enum AdmissionBlock: String, Equatable, Sendable {
     case revoked
     /// The service has just started and is still checking the runners it left running.
     case reconciling
+    /// Nestor approved the machine; the account is not confirmed on this Mac yet.
+    case awaitingConfirmation
+    /// An administrator paused the machine on the Nestor web app.
+    case pausedOnNestor
+}
+
+/// Whether Claude Code is signed in for this machine's runners, as their jobs tell. The service
+/// never holds Claude Code's token: the Mac's user keeps it once with
+/// `nestor-runner claude-token set`.
+public enum ClaudeSignIn: String, Equatable, Sendable {
+    case unknown
+    case notSignedIn
+    case signedIn
 }
 
 /// Whether the service accepts new tasks right now.
@@ -226,6 +246,9 @@ public struct MachineStatus: Equatable, Sendable {
     public var mode: AdmissionMode
     public var admission: AdmissionState
     public var maxConcurrentTasks: Int
+    /// What the service actually applies: `maxConcurrentTasks`, or 1 while Nestor cannot yet keep
+    /// workspaces apart at claim time.
+    public var effectiveMaxConcurrentTasks: Int
     /// Highest value accepted for `maxConcurrentTasks` (a sanity check on the input).
     public var maxConcurrentTasksUpperBound: Int
     /// Increases with every settings change; sent back with a change so two windows cannot
@@ -236,6 +259,8 @@ public struct MachineStatus: Equatable, Sendable {
     public var load: MachineLoad?
     /// Set when the service could not read its stored settings and started paused instead.
     public var configError: String?
+    /// A job failed because Claude Code is not signed in on this Mac.
+    public var claude: ClaudeSignIn
 
     public init(
         serviceMode: ServiceMode,
@@ -247,17 +272,59 @@ public struct MachineStatus: Equatable, Sendable {
         busyRunners: Int,
         activeTasks: [ActiveTask],
         load: MachineLoad?,
-        configError: String? = nil
+        configError: String? = nil,
+        effectiveMaxConcurrentTasks: Int? = nil,
+        claude: ClaudeSignIn = .unknown
     ) {
         self.serviceMode = serviceMode
         self.mode = mode
         self.admission = admission
         self.maxConcurrentTasks = maxConcurrentTasks
+        self.effectiveMaxConcurrentTasks = effectiveMaxConcurrentTasks ?? maxConcurrentTasks
         self.maxConcurrentTasksUpperBound = maxConcurrentTasksUpperBound
         self.configRevision = configRevision
         self.busyRunners = busyRunners
         self.activeTasks = activeTasks
         self.load = load
         self.configError = configError
+        self.claude = claude
     }
+
+    /// The requested value is above what the server allows for now.
+    public var cappedByServer: Bool { effectiveMaxConcurrentTasks < maxConcurrentTasks }
+}
+
+// MARK: Access to the service
+
+/// What the local service lets this app do, decided by the service from the app's code
+/// signature (docs/local-api.md, "Who may do what").
+public struct ServiceAccess: Equatable, Sendable {
+    public enum Level: String, Equatable, Sendable {
+        /// Read and change everything: the signed app.
+        case full
+        /// Read only, without runner logs: the signed command line tool.
+        case readOnly
+        /// Status only: an app the service could not verify.
+        case basic
+    }
+
+    public enum Verification: String, Equatable, Sendable {
+        /// The service checked the app's code signature.
+        case signature
+        /// Not verified; the service was started with `--allow-unsigned-clients` (development).
+        case unsignedFallback
+        case none
+        /// The in-app demo: there is no service.
+        case notApplicable
+    }
+
+    public var level: Level
+    public var verification: Verification
+
+    public init(level: Level, verification: Verification) {
+        self.level = level
+        self.verification = verification
+    }
+
+    public static let demo = ServiceAccess(level: .full, verification: .notApplicable)
 }

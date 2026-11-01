@@ -6,6 +6,12 @@ import SwiftUI
 enum Entry {
     static func main() {
         let options = LaunchOptions(arguments: CommandLine.arguments)
+        // A demo scenario never applies to the real service: refuse the mix rather than let a
+        // simulated state be shown next to a live connection (N8).
+        if options.socketPath != nil && options.demoScenarioGiven {
+            FileHandle.standardError.write(Data("--demo-scenario cannot be used with --service or --socket.\n".utf8))
+            exit(2)
+        }
         if let directory = options.snapshotDirectory {
             MainActor.assumeIsolated {
                 if let socket = options.socketPath {
@@ -23,6 +29,7 @@ enum Entry {
 /// Command-line options: the demo's other states, or the local service.
 struct LaunchOptions {
     var scenario: DemoRunnerService.Scenario = .populated
+    var demoScenarioGiven = false
     var snapshotDirectory: URL?
     var snapshotPrefix = "service"
     /// Set by `--service` (default socket) or `--socket <path>`: use the local service of `core/`
@@ -34,6 +41,7 @@ struct LaunchOptions {
         while let argument = iterator.next() {
             switch argument {
             case "--demo-scenario":
+                demoScenarioGiven = true
                 if let value = iterator.next(), let scenario = DemoRunnerService.Scenario(rawValue: value) {
                     self.scenario = scenario
                 }

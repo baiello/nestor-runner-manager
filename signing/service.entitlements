@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  nestor-runner-service (the local service). Signed with the hardened runtime
+  (codesign --options runtime). Never add com.apple.security.get-task-allow or
+  com.apple.security.cs.* exceptions: the machine key and credential (Secure Enclave, data protection Keychain) are bound to this signature,
+  and a process of the same user could otherwise inject code into the service (A4, N2).
+  TEAMID is replaced by scripts/sign-macos.sh.
+-->
+<plist version="1.0">
+<dict>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>TEAMID.fr.kocoa.nestor.runner-manager</string>
+	</array>
+</dict>
+</plist>

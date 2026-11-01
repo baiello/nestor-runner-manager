@@ -22,6 +22,8 @@ public enum RunnerServiceError: Error, Equatable, Sendable, LocalizedError {
     case invalidArgument(String)
     case permissionDenied
     case incompatibleVersion(String)
+    /// A sensitive change the service accepts only once the user has confirmed it.
+    case confirmationRequired(String)
 
     public var errorDescription: String? {
         switch self {
@@ -49,6 +51,8 @@ public enum RunnerServiceError: Error, Equatable, Sendable, LocalizedError {
             "The runner service refused the request: it belongs to another user."
         case .incompatibleVersion(let supported):
             "The runner service is incompatible with this app (it speaks API \(supported))."
+        case .confirmationRequired(let reason):
+            reason
         }
     }
 }
@@ -66,18 +70,30 @@ public protocol RunnerService: Sendable {
     /// and that report wins.
     var mode: ServiceMode { get }
 
+    /// What the service lets this app do.
+    func access() async throws -> ServiceAccess
     func machineInfo() async throws -> MachineInfo
     func connection() async throws -> NestorConnection
-    /// Associates the machine with a Nestor instance. The real flow happens in the browser
-    /// (device authorization); the interface never asks for a secret.
+    /// Starts associating the machine with Nestor (device authorization). The connection
+    /// becomes `.associating` with a code an administrator approves on the Nestor web app; the
+    /// interface never asks for a secret.
     func associate() async throws -> NestorConnection
+    /// Abandons an association in progress.
+    func cancelAssociation() async throws -> NestorConnection
+    /// The owner's answer to the account Nestor approved the machine for (`.confirming`):
+    /// accepted, the machine takes tasks; refused, it disassociates itself.
+    func confirmAssociation(accept: Bool) async throws -> NestorConnection
+    /// Ends the association. Call it only after the user confirmed: it ends the tasks running
+    /// on this machine and erases its credentials, even if Nestor cannot be reached.
+    func disassociate() async throws -> NestorConnection
 
     func machineStatus() async throws -> MachineStatus
     /// Pauses or resumes admissions. `expectedRevision` is the `configRevision` the change is
     /// based on; a stale one fails with `.conflict`.
     func setMode(_ mode: AdmissionMode, expectedRevision: Int) async throws -> MachineStatus
-    /// Sets how many tasks may run at the same time. Lowering it interrupts no task.
-    func setMaxConcurrentTasks(_ value: Int, expectedRevision: Int) async throws -> MachineStatus
+    /// Sets how many tasks may run at the same time. Lowering it interrupts no task. Raising it
+    /// needs `confirmed` (the user confirmed it), or fails with `.confirmationRequired`.
+    func setMaxConcurrentTasks(_ value: Int, expectedRevision: Int, confirmed: Bool) async throws -> MachineStatus
 
     // Diagnostics.
     func runners() async throws -> [Runner]
@@ -93,6 +109,10 @@ extension RunnerService {
     public func stop(runnerID: Runner.ID) async throws -> Runner {
         try await stop(runnerID: runnerID, force: false)
     }
+
+    public func setMaxConcurrentTasks(_ value: Int, expectedRevision: Int) async throws -> MachineStatus {
+        try await setMaxConcurrentTasks(value, expectedRevision: expectedRevision, confirmed: false)
+    }
 }
 
 public enum RunnerNameRule {
@@ -107,9 +127,10 @@ public enum RunnerNameRule {
         if name.count > maxLength {
             throw RunnerServiceError.invalidName("Use at most \(maxLength) characters.")
         }
-        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_. "))
+        // ASCII only, as the service checks it again (no look-alike names).
+        let allowed = Set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_. ".unicodeScalars)
         if name.unicodeScalars.contains(where: { !allowed.contains($0) }) {
-            throw RunnerServiceError.invalidName("Use letters, digits, spaces, “-”, “_” or “.”.")
+            throw RunnerServiceError.invalidName("Use letters (A to Z), digits, spaces, “-”, “_” or “.”.")
         }
         return name
     }

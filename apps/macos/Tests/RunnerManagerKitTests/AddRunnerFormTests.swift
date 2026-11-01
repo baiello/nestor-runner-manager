@@ -15,15 +15,21 @@ private actor GatedRunnerService: RunnerService {
         waiting = nil
     }
 
+    func access() async throws -> ServiceAccess { try await demo.access() }
     func machineInfo() async throws -> MachineInfo { try await demo.machineInfo() }
     func connection() async throws -> NestorConnection { try await demo.connection() }
     func associate() async throws -> NestorConnection { try await demo.associate() }
+    func cancelAssociation() async throws -> NestorConnection { try await demo.cancelAssociation() }
+    func confirmAssociation(accept: Bool) async throws -> NestorConnection {
+        try await demo.confirmAssociation(accept: accept)
+    }
+    func disassociate() async throws -> NestorConnection { try await demo.disassociate() }
     func machineStatus() async throws -> MachineStatus { try await demo.machineStatus() }
     func setMode(_ mode: AdmissionMode, expectedRevision: Int) async throws -> MachineStatus {
         try await demo.setMode(mode, expectedRevision: expectedRevision)
     }
-    func setMaxConcurrentTasks(_ value: Int, expectedRevision: Int) async throws -> MachineStatus {
-        try await demo.setMaxConcurrentTasks(value, expectedRevision: expectedRevision)
+    func setMaxConcurrentTasks(_ value: Int, expectedRevision: Int, confirmed: Bool) async throws -> MachineStatus {
+        try await demo.setMaxConcurrentTasks(value, expectedRevision: expectedRevision, confirmed: confirmed)
     }
     func runners() async throws -> [Runner] { try await demo.runners() }
     func addRunner(_ request: NewRunnerRequest) async throws -> Runner {

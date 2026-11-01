@@ -7,11 +7,13 @@ import SwiftUI
 struct OverviewView: View {
     var model: RunnerManagerModel
     @Binding var selection: SidebarItem?
+    @State private var isConfirmingDisassociation = false
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 Text("This Mac").font(.largeTitle.bold())
+                claudeBanner
                 connectionCard
                 tasksCard
                 activeTasksCard
@@ -39,9 +41,61 @@ struct OverviewView: View {
                     .foregroundStyle(.green)
                 InfoRow(label: "Instance", value: instance)
                 InfoRow(label: "Since", value: Format.relative(since))
-                Text("Workspaces are assigned to this machine's runners on the Nestor web app, not here.")
+                Text("Workspaces are assigned to this machine on the Nestor web app, not here.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
+                disassociateButton
+            case .loaded(.associating(let instance, let userCode, let verificationURL, let expiresAt)):
+                Label("Waiting for approval", systemImage: "hourglass").foregroundStyle(.orange)
+                Text("An administrator approves this Mac on Nestor with this code:")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Text(userCode)
+                    .font(.system(.title, design: .monospaced).bold())
+                    .textSelection(.enabled)
+                    .accessibilityLabel("Approval code \(userCode)")
+                InfoRow(label: "Instance", value: instance)
+                InfoRow(label: "Expires", value: Format.relative(expiresAt))
+                HStack {
+                    if let url = URL(string: verificationURL), url.scheme == "https" {
+                        Link("Open Nestor", destination: url)
+                    }
+                    Button("Cancel") { Task { await model.cancelAssociation() } }
+                        .disabled(!model.canChange)
+                }
+                Label(
+                    "Never give this code to anyone, nor type a code someone gave you: whoever approves it first gets this Mac to run their tasks.",
+                    systemImage: "exclamationmark.shield.fill"
+                )
+                .font(.callout.weight(.medium))
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+                Text("The code alone gives no access: the approval needs an administrator signed in to Nestor. Nothing secret is shown or typed here.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            case .loaded(.confirming(let instance, let accountEmail, let approvedByEmail)):
+                Label("Confirm the Nestor account", systemImage: "person.badge.shield.checkmark")
+                    .foregroundStyle(.orange)
+                Text("Nestor approved this Mac. Check that this is your account before it takes any task:")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                InfoRow(label: "Account", value: accountEmail)
+                InfoRow(label: "Approved by", value: approvedByEmail)
+                InfoRow(label: "Instance", value: instance)
+                Text("Nestor masks the addresses. Nothing runs on this Mac until you confirm.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    Button("This Is My Account") { Task { await model.confirmAssociation(accept: true) } }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!model.canChange)
+                    Button("Not Mine — Disassociate", role: .destructive) {
+                        Task { await model.confirmAssociation(accept: false) }
+                    }
+                    .disabled(!model.canChange)
+                }
             case .loaded(.unreachable(let instance, let reason)):
                 Label("Unreachable", systemImage: "wifi.exclamationmark").foregroundStyle(.orange)
                 InfoRow(label: "Instance", value: instance)
@@ -57,13 +111,55 @@ struct OverviewView: View {
                 associateButton
             case .loaded(.notAssociated):
                 Label("Not associated", systemImage: "link.badge.plus").foregroundStyle(.secondary)
-                Text("Associate this machine once; the service then manages its runners and Nestor gives each one its own identity. You will confirm the association in your browser — no password or token is typed here.")
+                Text("Associate this machine once; the service then manages its runners and Nestor gives each one its own identity. An administrator approves it on Nestor with a code shown here — no password or token is typed here.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 associateButton
             }
         }
+    }
+
+    /// A7: jobs fail while Claude Code is not signed in on this Mac. The service never holds its
+    /// token; the Mac's user keeps it once in a terminal of their session.
+    @ViewBuilder
+    private var claudeBanner: some View {
+        if case .loaded(let status) = model.status, status.claude == .notSignedIn {
+            VStack(alignment: .leading, spacing: 6) {
+                Label("Claude is not signed in", systemImage: "exclamationmark.triangle.fill")
+                    .font(.headline)
+                    .foregroundStyle(.orange)
+                Text("Tasks on this Mac fail until Claude Code's token is kept for its runners. In Terminal, as this Mac's user, run once:")
+                    .font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("nestor-runner claude-token set")
+                    .font(.system(.callout, design: .monospaced))
+                    .textSelection(.enabled)
+                Text("Make the token with `claude setup-token` first. It stays in your login keychain; this app and its service never see it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+            .accessibilityElement(children: .combine)
+        }
+    }
+
+    private var disassociateButton: some View {
+        Button("Disassociate…", role: .destructive) { isConfirmingDisassociation = true }
+            .disabled(!model.canChange)
+            .confirmationDialog(
+                "Disassociate this Mac from Nestor?",
+                isPresented: $isConfirmingDisassociation
+            ) {
+                Button("Disassociate and End Running Tasks", role: .destructive) {
+                    Task { await model.disassociate() }
+                }
+            } message: {
+                Text("The tasks running on this Mac end now, and its credentials are erased, even if Nestor cannot be reached. Associate it again to take tasks.")
+            }
     }
 
     private var associateButton: some View {
@@ -73,7 +169,7 @@ struct OverviewView: View {
                     Task { await model.associate() }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(model.isAssociating)
+                .disabled(model.isAssociating || !model.canChange)
                 if model.isAssociating { ProgressView().controlSize(.small) }
             }
             if model.isDemo {
@@ -210,29 +306,50 @@ struct TasksControls: View {
             .pickerStyle(.segmented)
             .labelsHidden()
             .frame(width: 220)
-            .disabled(model.isUpdatingSettings)
+            .disabled(model.isUpdatingSettings || !model.canChange)
         }
 
         LabeledContent("Tasks at a time") {
             HStack(spacing: 8) {
-                Text("\(status.busyRunners) running of \(status.maxConcurrentTasks)")
+                Text("\(status.busyRunners) running of \(status.effectiveMaxConcurrentTasks)")
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
                 Stepper(
                     "\(status.maxConcurrentTasks)",
                     value: Binding(
                         get: { status.maxConcurrentTasks },
-                        set: { value in Task { await model.setMaxConcurrentTasks(value) } }
+                        set: { value in Task { await model.requestMaxConcurrentTasks(value) } }
                     ),
                     in: 1...max(1, status.maxConcurrentTasksUpperBound)
                 )
                 .monospacedDigit()
-                .disabled(model.isUpdatingSettings)
+                .disabled(model.isUpdatingSettings || !model.canChange)
                 .accessibilityLabel("Tasks at a time")
+                .confirmationDialog(
+                    "Run more tasks at the same time?",
+                    isPresented: Binding(
+                        get: { model.pendingCeilingRaise != nil },
+                        set: { if !$0 { model.pendingCeilingRaise = nil } }
+                    ),
+                    presenting: model.pendingCeilingRaise
+                ) { value in
+                    Button("Allow \(value) Tasks at a Time") { Task { await model.confirmCeilingRaise() } }
+                } message: { value in
+                    Text("Up to \(value) tasks will run side by side on this Mac, always from the same workspace. Lowering it again never stops a running task.")
+                }
                 .accessibilityValue("\(status.maxConcurrentTasks)")
             }
         }
 
+        if status.cappedByServer {
+            Label(
+                "Limited by the server to \(status.effectiveMaxConcurrentTasks) at a time for now: running tasks side by side needs Nestor to keep workspaces apart. Your setting of \(status.maxConcurrentTasks) applies once it does.",
+                systemImage: "lock.circle"
+            )
+            .font(.callout)
+            .foregroundStyle(.orange)
+            .fixedSize(horizontal: false, vertical: true)
+        }
         Text("This is how many tasks the machine accepts at the same time — not a processor or memory limit. Pausing or lowering it never stops a running task: it only holds back new ones. The service starts and stops runners to match.")
             .font(.callout)
             .foregroundStyle(.secondary)
@@ -254,6 +371,8 @@ extension AdmissionState {
         case .blocked(.unreachable): "Waiting for Nestor"
         case .blocked(.revoked): "Not taking tasks"
         case .blocked(.reconciling): "Starting"
+        case .blocked(.awaitingConfirmation): "Not taking tasks"
+        case .blocked(.pausedOnNestor): "Paused on Nestor"
         }
     }
 
@@ -265,6 +384,8 @@ extension AdmissionState {
         case .blocked(.unreachable): "Nestor cannot be reached. Running tasks continue."
         case .blocked(.revoked): "The association was revoked in Nestor."
         case .blocked(.reconciling): "The service is checking the runners it left running."
+        case .blocked(.awaitingConfirmation): "Confirm the Nestor account above first."
+        case .blocked(.pausedOnNestor): "An administrator paused this machine on the Nestor web app. Running tasks finish."
         }
     }
 

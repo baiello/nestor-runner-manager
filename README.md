@@ -17,7 +17,18 @@ A desktop application and a local service to put a machine at Nestor's disposal.
 
 A runner takes **one task at a time**; that task may use several threads and processes. There is **no processor or memory limit** per runner: the number of tasks at a time regulates admissions, and the figures shown are measurements.
 
-Workspaces are not assigned here: on the Nestor web app, a workspace is assigned to runners or pools. The interface never asks for a password or a token; in the real version the association is confirmed in the browser and Nestor issues each runner its own credential.
+Workspaces are not assigned here: on the Nestor web app, workspaces are assigned to the machine. The interface never asks for a password or a token: an administrator approves the machine on Nestor with a code the interface shows — never give that code to anyone — then the interface shows the Nestor account the machine would work for, and nothing runs until you confirm it is yours. Nestor issues a short-lived credential for each runner launch. Security design and evidence: [docs/security.md](docs/security.md).
+
+### Claude Code on this Mac (one step, by the Mac's user)
+
+The service never sends nor keeps a Claude Code token. Each runner uses the one its Mac's user keeps, once, in their login keychain:
+
+```sh
+claude setup-token                 # makes a long-lived token for Claude Code
+nestor-runner claude-token set     # keeps it in the login keychain (macOS); paste it when asked
+```
+
+Run it in a terminal of that user's session (the login keychain is the session's). Until it is done, every task on the Mac fails `claude_not_signed_in`, and the app shows **Claude is not signed in** once a runner reports that reason (`run-once` does not report it yet: see docs/security.md).
 
 | Paused | Diagnostics | Busy runner | Failed runner |
 | --- | --- | --- | --- |
@@ -26,6 +37,10 @@ Workspaces are not assigned here: on the Nestor web app, a workspace is assigned
 | Add a runner (advanced) | Not associated | Service unavailable | Loading |
 | --- | --- | --- | --- |
 | ![Add a runner](docs/screenshots/06-add-runner.png) | ![Not associated](docs/screenshots/07-not-associated.png) | ![Service unavailable](docs/screenshots/08-service-unavailable.png) | ![Loading](docs/screenshots/09-loading.png) |
+
+| Waiting for approval — never give the code | Confirm the Nestor account (M1) | Claude is not signed in (A7) |
+| --- | --- | --- |
+| ![Associating](docs/screenshots/12-associating.png) | ![Confirming](docs/screenshots/13-confirming.png) | ![Claude not signed in](docs/screenshots/14-claude-not-signed-in.png) |
 
 Through the real local service (diagnostics):
 
@@ -62,14 +77,14 @@ swift build -c release --arch arm64           # Apple Silicon release build
 lipo -archs "$(swift build -c release --arch arm64 --show-bin-path)/NestorRunnerManager"   # → arm64
 ```
 
-Demo scenarios (`--demo-scenario`): `populated` (default), `empty`, `notAssociated`, `unavailable`.
+Demo scenarios (`--demo-scenario`): `populated` (default), `empty`, `notAssociated`, `associating`, `confirming`, `claudeNotSignedIn`, `unavailable`. They apply to the in-app demo only: the app refuses `--demo-scenario` together with `--service` or `--socket`.
 
 With the local service (see [core/README.md](core/README.md)):
 
 ```sh
 (cd ../../core && cargo run --bin nestor-runner-service)            # live, in another terminal
-swift run NestorRunnerManager --service
-(cd ../../core && cargo run --bin nestor-runner-service -- --simulate)
+swift run NestorRunnerManager --service                             # an unsigned build gets read-only access
+(cd ../../core && cargo run --features dev-unsigned --bin nestor-runner-service -- --simulate --allow-unsigned-clients)
 swift run NestorRunnerManager --socket "$HOME/Library/Application Support/Nestor Runner Manager/demo/run/service.sock"
 ```
 
@@ -88,15 +103,24 @@ swift build
 swift test -Xswiftc -load-plugin-library -Xswiftc /Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing/libTestingMacros.dylib
 ```
 
-## Continuous integration
+## Local verification
 
-`.github/workflows/macos.yml` builds, tests and makes an arm64 release build of the app, and tests and lints `core/`, on GitHub's macOS runner for each pull request and each push to `main`. GitHub-hosted runners are free for public repositories.
+The checks run on the developer's Mac, by hand, before a push: `scripts/verify-local.sh` builds, tests and makes an arm64 release build of the app, formats, tests and lints `core/`, checks that a release build of the service refuses the development-only unsigned fallback (M1), and signs both binaries ad hoc with `scripts/sign-macos.sh` to check the signing configuration (hardened runtime, no `get-task-allow`). It installs nothing and needs no certificate nor privilege. Every pull request carries its result on its head commit: the command, the commit and the outcome.
+
+```sh
+scripts/verify-local.sh               # app and core
+scripts/verify-local.sh --contract    # also the contract test with the real nestor-runner run-once
+```
+
+The contract test with the real `nestor-runner run-once` (`core/tests/contract_run_once.rs`) needs read access to nestor, which is private: `--contract` builds the runner with `scripts/nestor-runner.sh` (git's own credentials, or a local clone in `NESTOR_SOURCE`). nestor runs the same test from its side by hand, with `make contract-check`, against the commit of this repository it pins in `contract/runner-manager.rev`. See [contract/README.md](contract/README.md).
+
+`.github/workflows/macos.yml`, which predates the local service, builds and tests the app only; no check of `core/` and no signing step runs on GitHub.
 
 ## Next steps
 
-1. Nestor API work (KCA-719): association by device authorization, one credential per runner, telemetry, and admission against the runner's existing claim protocol. Then the real runner behind the service's launcher, on a test Nestor first.
-2. Credentials in the Keychain; security review of the association and of the local API (KCA-720).
-3. Start at login (LaunchAgent), signing, installation on the Mac Studio — each to be authorized first.
+1. Nestor API work (contract v2, S1 to S7): device authorization, machine credential and runner credentials, eligible count per scope, lease ceiling, pause and scope enforced at claim (S6), the runner's one-job mode (S7). Then an HTTP client behind `NestorApi` and the real runner behind `ProcessLauncher`, on a test Nestor first. Security review before any real integration.
+2. Signing: no Apple Developer certificate nor notarization for now (Brice, 2026-11-01); the trials use ad hoc signatures. That leaves the Secure Enclave key, the Keychain and the verification of the app by Developer ID out of reach: the trials need the software key of A6 and a pinned app, Open 1 and Open 2 of [docs/launch-daemon.md](docs/launch-daemon.md), each to be decided and reviewed first.
+3. Start before login: a LaunchDaemon installed by Brice with `sudo`, under Brice's own account, binaries and plist owned by root (Brice, 2026-11-01; contract and procedure in [docs/launch-daemon.md](docs/launch-daemon.md)). The installation on the Mac Studio is still to be authorized.
 4. Admission driven by memory pressure and CPU, after real measurements on the Mac Studio.
 5. Windows and Linux clients on the same core.
 

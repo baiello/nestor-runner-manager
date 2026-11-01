@@ -12,6 +12,12 @@ public actor DemoRunnerService: RunnerService {
         case empty
         /// Not associated with Nestor yet.
         case notAssociated
+        /// Waiting for the (simulated) approval of the association on Nestor.
+        case associating
+        /// Approved on (simulated) Nestor; the account waits for the owner's confirmation.
+        case confirming
+        /// Associated, but the last job failed: Claude Code is not signed in on this Mac.
+        case claudeNotSignedIn
         /// Every call fails, to show the error states.
         case unavailable
     }
@@ -42,7 +48,7 @@ public actor DemoRunnerService: RunnerService {
         self.now = now
         let start = now()
         switch scenario {
-        case .populated:
+        case .populated, .claudeNotSignedIn:
             connectionState = .associated(instance: Self.demoInstance, since: start.addingTimeInterval(-86_400 * 3))
             let seeded = Self.seedRunners(at: start)
             runnerList = seeded.map(\.runner)
@@ -55,8 +61,27 @@ public actor DemoRunnerService: RunnerService {
             connectionState = .notAssociated
             runnerList = []
             logsByRunner = [:]
+        case .associating:
+            connectionState = .associating(
+                instance: Self.demoInstance,
+                userCode: "DEMO-4821",
+                verificationURL: "https://\(Self.demoInstance)/machines/approve",
+                expiresAt: start.addingTimeInterval(540)
+            )
+            runnerList = []
+            logsByRunner = [:]
+        case .confirming:
+            connectionState = Self.confirmingState
+            runnerList = []
+            logsByRunner = [:]
         }
     }
+
+    static let confirmingState = NestorConnection.confirming(
+        instance: demoInstance,
+        accountEmail: "o***r@example.com",
+        approvedByEmail: "a***n@example.com"
+    )
 
     // MARK: RunnerService
 
@@ -73,6 +98,11 @@ public actor DemoRunnerService: RunnerService {
         )
     }
 
+    public func access() async throws -> ServiceAccess {
+        try await simulateCall()
+        return .demo
+    }
+
     public func connection() async throws -> NestorConnection {
         try await simulateCall()
         return connectionState
@@ -80,7 +110,32 @@ public actor DemoRunnerService: RunnerService {
 
     public func associate() async throws -> NestorConnection {
         try await simulateCall()
-        connectionState = .associated(instance: Self.demoInstance, since: now())
+        // The simulated Nestor approves at once; the owner still confirms the account (M1).
+        connectionState = Self.confirmingState
+        return connectionState
+    }
+
+    public func confirmAssociation(accept: Bool) async throws -> NestorConnection {
+        try await simulateCall()
+        guard case .confirming = connectionState else {
+            throw RunnerServiceError.unavailable("No association waits for a confirmation.")
+        }
+        connectionState = accept ? .associated(instance: Self.demoInstance, since: now()) : .notAssociated
+        return connectionState
+    }
+
+    public func cancelAssociation() async throws -> NestorConnection {
+        try await simulateCall()
+        if case .associating = connectionState { connectionState = .notAssociated }
+        return connectionState
+    }
+
+    /// Ends the simulated association: the simulated runners stop and are forgotten.
+    public func disassociate() async throws -> NestorConnection {
+        try await simulateCall()
+        connectionState = .notAssociated
+        runnerList = []
+        logsByRunner = [:]
         return connectionState
     }
 
@@ -97,11 +152,15 @@ public actor DemoRunnerService: RunnerService {
         return status()
     }
 
-    public func setMaxConcurrentTasks(_ value: Int, expectedRevision: Int) async throws -> MachineStatus {
+    public func setMaxConcurrentTasks(_ value: Int, expectedRevision: Int, confirmed: Bool) async throws -> MachineStatus {
         try await simulateCall()
         try checkRevision(expectedRevision)
         guard (1...Self.cpuCores).contains(value) else {
             throw RunnerServiceError.limitOutOfRange(min: 1, max: Self.cpuCores)
+        }
+        // Same rule as the service: raising needs the user's confirmation.
+        if value > maxConcurrentTasks && !confirmed {
+            throw RunnerServiceError.confirmationRequired("Confirm first: running more tasks at the same time")
         }
         // Lowering the ceiling interrupts nothing: busy runners keep their task.
         maxConcurrentTasks = value
@@ -193,7 +252,8 @@ public actor DemoRunnerService: RunnerService {
     private func status() -> MachineStatus {
         let admission: AdmissionState = switch connectionState {
         case .associated: admissionMode == .paused ? .paused : .open
-        case .notAssociated: .blocked(.notAssociated)
+        case .notAssociated, .associating: .blocked(.notAssociated)
+        case .confirming: .blocked(.awaitingConfirmation)
         case .unreachable: .blocked(.unreachable)
         case .revoked: .blocked(.revoked)
         }
@@ -219,7 +279,8 @@ public actor DemoRunnerService: RunnerService {
                 memoryTotalBytes: 128 * Self.gib,
                 memoryPressure: .normal,
                 diskFreeBytes: 1_200 * Self.gib
-            )
+            ),
+            claude: scenario == .claudeNotSignedIn ? .notSignedIn : .unknown
         )
     }
 

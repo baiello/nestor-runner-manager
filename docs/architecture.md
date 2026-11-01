@@ -1,6 +1,6 @@
 # Architecture
 
-Nestor Runner Manager has native interfaces per operating system on top of one shared core written in Rust. The machine is the main object: it is associated with Nestor once, and a local service manages its runners. Runners are a technical detail, shown in the diagnostics. The design contract is KCA-717; the local API is specified in [local-api.md](local-api.md).
+Nestor Runner Manager has native interfaces per operating system on top of one shared core written in Rust. The machine is the main object: it is associated with Nestor once, and a local service manages its runners. Runners are a technical detail, shown in the diagnostics. The design contract is KCA-717, revised by contract v2 (KCA-724) and the security review KCA-727; the local API is specified in [local-api.md](local-api.md), the security design and its evidence in [security.md](security.md).
 
 ```
 ┌──────────────────────────────┐   ┌──────────────┐   ┌──────────────┐
@@ -9,31 +9,40 @@ Nestor Runner Manager has native interfaces per operating system on top of one s
 │  RunnerManagerModel          │   └──────┬───────┘   └──────┬───────┘
 │  RunnerService ◄─────────────┼──┐       │                  │
 │   ├ DemoRunnerService (demo) │  │       │                  │
-│   └ LiveRunnerService ───────┼──┤  local API: JSON lines on a Unix socket,
-└──────────────────────────────┘  │  owner-only (docs/local-api.md)
+│   └ LiveRunnerService ───────┼──┤  local API: JSON lines on a Unix socket; access
+└──────────────────────────────┘  │  by code signature (local-api.md, security.md)
                                   ▼
                ┌──────────────────────────────────────────┐
                │ core/ — nestor-runner-service (Rust)     │
-               │  Regulator   admission tokens, pause,    │
-               │              tasks-at-a-time ceiling     │
-               │  Supervisor  runner state machines, pool │
-               │              sizing, idle stop, crash    │
-               │              restart, adoption on start  │
+               │  Regulator   one-job launches: pause,    │
+               │              ceiling, one scope at once  │
+               │  Supervisor  runner state machines,      │
+               │              drains, terminations, crash │
+               │              backoff, adoption on start  │
+               │  Associator  device authorization, key,  │
+               │              account confirmation (M1),  │
+               │              heartbeat, queue, tokens,   │
+               │              disassociation              │
+               │  MachineClient  proof v2, one request at │
+               │              a time  ──► NestorApi       │
                │  FileStore   state.json (no secret)      │
-               │  Launcher    fake (tests, --simulate) |  │
-               │              real runner (not yet)       │
+               │  Secrets     Keychain, Secure Enclave    │
+               │  Launcher    ProcessLauncher (argv, fd 3 │
+               │              credential) | fake          │
                └──────────────────────────────────────────┘
 ```
 
 ## Rules
 
 - **Admission is not a resource quota.** The machine accepts at most `maxConcurrentTasks` tasks at the same time (1 by default, adjustable). No runner has a processor or memory limit (KCA-714); load figures are measurements.
-- **One task per runner**, several runners per machine. A runner needs an admission token from the service before it claims a task from Nestor, and gives it back when the task ends.
-- **Pause** holds back new tasks; **lowering the ceiling** too. Neither stops a running task. Idle runners above what is needed are stopped after 60 s.
-- **No double launch.** Every supervisor operation runs under one lock; each runner has a generation, and reports from an older generation are ignored. One service per data directory (`flock`). After a restart nothing is admitted until the processes left running are adopted (counted busy until they report idle) or cleared.
-- **Crashes** restart with an exponential backoff (1 s, 2 s, 4 s … up to 5 min); after five in a row the runner is `failed` and left for diagnosis. A task lost with its runner is reported `runnerLost`; Nestor's existing policy decides what happens to it.
-- **Workspaces are assigned on the Nestor web app.** The service holds no right on workspaces; each runner will serve what Nestor grants its own credential.
-- **Secrets** never go through the interface, the local API, the state file or the logs. Nestor issues each runner its own credential, to be kept in the Keychain (not in this version).
+- **One job per runner process.** Launching a "one job" runner *is* the admission: it claims at most one task, runs it and exits. Several runners per machine; each keeps a stable identity and a new generation per launch.
+- **One scope at a time** (B1(b)): runners alive together all claim from the same workspace scope; Nestor enforces it at claim time (S6). More than one task at a time only once Nestor announces `capabilities.scope_filter`, and never above the limit its administrator set (`leases.administrator_max`); launches are sized by Nestor's count of eligible jobs minus the runners already waiting for one. No `--scope` is passed yet.
+- **Pause** holds back new tasks; **lowering the ceiling** too. Neither stops a running task: runners without a task are drained. Only revocation, disassociation and a forced stop end a running task.
+- **No double launch.** Every supervisor operation runs under one lock; reports from an older generation are ignored. One service per data directory (`flock`). After a restart nothing is launched until the processes left running are adopted (pid, start time and generation must all match) or cleared.
+- **Crashes** relaunch with an exponential backoff (1 s, 2 s, 4 s … up to 5 min); after five in a row the runner is `failed` and left for diagnosis. A task lost with its runner is reported `runnerLost`; Nestor's existing policy decides what happens to it.
+- **Workspaces are assigned to the machine on the Nestor web app.** The service never asks for a scope; Nestor computes what each runner credential may claim.
+- **Secrets** never go through the interface, the local API, the state file or the logs (masked at the source). The machine credential is in the Keychain, the machine key in the Secure Enclave; runner credentials are issued per launch and passed on an inherited pipe, never stored.
+- **The local control is regulation, not a security boundary**: Nestor enforces leases, ceiling, pause and scope.
 - **Demo is never presented as real.** Each service reports `serviceMode`; the interface shows the demo banner unless it is `live`. Demo logs start with `[demo]`. Demo and live keep their state apart.
 - **Fail safe.** Unreadable settings start the service paused with one task at a time and show the error.
 
@@ -48,10 +57,10 @@ Nestor Runner Manager has native interfaces per operating system on top of one s
 
 ## The core
 
-`core/` is a Rust crate (`nestor-runner-core`) with the binary `nestor-runner-service`, run in the user's session — no privileged installation. Modules: `admission`, `supervisor`, `persist`, `ipc`, `load`, `fake`, `demo`. See [core/README.md](../core/README.md).
+`core/` is a Rust crate (`nestor-runner-core`) with the binary `nestor-runner-service`, run in the user's session — no privileged installation. Modules: `admission`, `supervisor`, `process`, `sweep`, `association`, `nestor`, `secrets`, `persist`, `ipc`, `mask`, `load`, `sys`, `fake`, `demo`. The launcher speaks launch contract v1 of `nestor-runner run-once`, whose fixtures are vendored in `contract/run-once-v1.json`. See [core/README.md](../core/README.md).
 
 ## Not in this version
 
-- The real runner: the live service has no launcher yet, so it provisions and starts nothing, and association with Nestor answers `unavailable`. Both need the Nestor API work framed in KCA-719 (device authorization, per-runner credentials, telemetry, admission against the existing claim protocol).
-- Keychain storage, start at login (LaunchAgent), signing and notarization, installation on the Mac Studio — not authorized in this lot (KCA-717 §6.B).
+- The Nestor API for machines (S1 to S6): until it exists, the live service has no `NestorApi`, answers `unavailable` to `associate` and launches nothing. The runner's one-job mode exists (`nestor-runner run-once`, S7); the launcher follows its contract v1, is tested against a double that checks the vendored fixtures, and against the real binary built at the nestor commit pinned in `contract/nestor.rev` (`core/tests/contract_run_once.rs`, R2 of KCA-737, the `contract` job of the CI).
+- Signing (A6): the Secure Enclave key, the Keychain and the verification of the app by the service need it; no certificate is bought for now and the trials are signed ad hoc (Brice, 2026-11-01). Start before login is a LaunchDaemon under Brice's account ([launch-daemon.md](launch-daemon.md)); its installation on the Mac Studio is not authorized in this lot (contract §6.B, see security.md).
 - Load-driven admission (CPU, memory pressure): after real measurements on the Mac Studio (KCA-717 §9).

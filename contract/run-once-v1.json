@@ -1,0 +1,105 @@
+{
+  "contract": 1,
+  "source": "nestor docs/run-once-contract.md and contract/run-once-v1.json (KCA-734 §2). Vendored copy; the pinned nestor revision goes in contract/nestor.rev (R2).",
+  "argv": {
+    "program": "nestor-runner",
+    "subcommand": ["run-once"],
+    "required": ["--runner-id", "--generation", "--machine-id", "--server", "--credential-fd", "--report-fd"],
+    "optional": ["--idle-seconds", "--log"],
+    "forbidden": ["--scope"],
+    "fixed": { "--credential-fd": "3", "--report-fd": "4" },
+    "formats": {
+      "--runner-id": "^[0-9a-f]{8,64}$",
+      "--generation": "^[0-9]{1,20}$",
+      "--machine-id": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "--server": "^https://[^/@?#]+$",
+      "--idle-seconds": "^([5-9]|[1-9][0-9]|[1-5][0-9][0-9]|600)$"
+    },
+    "unknown_or_repeated_option_exit": 64,
+    "example": [
+      "run-once",
+      "--runner-id", "0123456789abcdef0123456789abcdef",
+      "--generation", "7",
+      "--machine-id", "6f1c2a4e-9b3d-4c5e-8f70-1a2b3c4d5e6f",
+      "--server", "https://nestor.example",
+      "--credential-fd", "3",
+      "--report-fd", "4"
+    ]
+  },
+  "environment": {
+    "allowed": ["PATH", "LANG", "HOME", "TMPDIR"],
+    "secrets": "never"
+  },
+  "credential": {
+    "fd": 3,
+    "max_bytes": 16384,
+    "read_timeout_seconds": 10,
+    "close_before_any_other_work": true,
+    "fields": { "runner_token": "required", "claude_code_token": "optional" },
+    "deny_unknown_fields": true,
+    "valid": [
+      { "runner_token": "nestor_runner_example_credential_0000" },
+      { "runner_token": "nestor_runner_example_credential_0000", "claude_code_token": "sk-ant-oat01-example-claude-code-token-0000" }
+    ],
+    "invalid": [
+      "nestor_runner_example_credential_0000",
+      "{}",
+      "{\"runner_token\":\"nestor_runner_example_credential_0000\",\"scope\":\"w\"}",
+      "{\"runner_token\":42}"
+    ]
+  },
+  "drain": {
+    "fd": 0,
+    "line": "drain\n",
+    "eof_is_drain": true
+  },
+  "reports": {
+    "fd": 4,
+    "cloexec": true,
+    "version": 1,
+    "max_line_bytes": 4096,
+    "max_per_second": 20,
+    "first": "hello",
+    "at_most_once": ["hello", "claimed"],
+    "types": {
+      "hello": ["contract", "runner_id", "generation", "pid"],
+      "claimed": ["job_id"],
+      "finished": ["outcome"],
+      "idle": []
+    },
+    "outcomes": ["done", "failed", "abandoned", "lease_lost", "released"],
+    "valid": [
+      "{\"v\":1,\"type\":\"hello\",\"contract\":1,\"runner_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":7,\"pid\":4242}",
+      "{\"v\":1,\"type\":\"claimed\",\"job_id\":\"job-01a188f4\"}",
+      "{\"v\":1,\"type\":\"finished\",\"outcome\":\"done\"}",
+      "{\"v\":1,\"type\":\"finished\",\"outcome\":\"failed\"}",
+      "{\"v\":1,\"type\":\"finished\",\"outcome\":\"abandoned\"}",
+      "{\"v\":1,\"type\":\"finished\",\"outcome\":\"lease_lost\"}",
+      "{\"v\":1,\"type\":\"finished\",\"outcome\":\"released\"}",
+      "{\"v\":1,\"type\":\"idle\"}"
+    ],
+    "invalid": [
+      "{\"event\":\"ready\"}",
+      "{\"v\":2,\"type\":\"idle\"}",
+      "{\"v\":1,\"type\":\"scope\",\"scope\":\"w\"}",
+      "{\"v\":1,\"type\":\"claimed\",\"job_id\":\"job-1\",\"scope\":\"w\"}",
+      "{\"v\":1,\"type\":\"claimed\",\"job_id\":\"job-1\",\"repository\":\"https://example.invalid/r.git\"}",
+      "{\"v\":1,\"type\":\"finished\",\"outcome\":\"succeeded\"}",
+      "{\"v\":1,\"type\":\"hello\",\"contract\":1,\"runner_id\":\"0123456789abcdef\",\"generation\":\"7\",\"pid\":1}",
+      "not json"
+    ]
+  },
+  "exit_codes": {
+    "0": "ok",
+    "64": "usage",
+    "65": "credential_invalid",
+    "70": "internal",
+    "75": "unreachable",
+    "77": "revoked"
+  },
+  "signals": {
+    "terminate": "SIGTERM",
+    "grace_seconds": 10,
+    "then": "SIGKILL and sweep of the descendants (KCA-734 §4)"
+  }
+}

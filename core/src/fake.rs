@@ -2,27 +2,36 @@
 //!
 //! [`FakeLauncher`] keeps pretend processes in memory, for the tests and the `--simulate` demo of
 //! the service. It records every launch so tests can check that a runner never has two live
-//! processes. [`UnavailableLauncher`] is what the live service uses until the real runner is
-//! integrated: it refuses to provision or launch anything.
+//! processes, and every drain and termination so they can check that nothing busy was
+//! interrupted. [`UnavailableLauncher`] is what the live service uses while no real runner can be
+//! launched: it refuses to launch anything.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use crate::model::ServiceError;
 use crate::persist::RunnerRecord;
-use crate::supervisor::Launcher;
+use crate::supervisor::{LaunchTarget, Launcher, PendingLaunch};
+use crate::sys::ProcessIdentity;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FakeProcess {
     pub runner_id: String,
     pub generation: u64,
     pub pid: u32,
-    pub terminate_requested: bool,
+    pub scope: Option<String>,
+    /// Asked to stop claiming and exit after its job.
+    pub drained: bool,
+    /// Asked to end now (graceful signal).
+    pub terminated: bool,
+    /// Killed.
+    pub killed: bool,
+    /// Got its credential: only once its identity was saved (KCA-741).
+    pub credential: bool,
 }
 
 #[derive(Default)]
 pub struct FakeLauncher {
-    state: Mutex<FakeState>,
+    state: Arc<Mutex<FakeState>>,
 }
 
 #[derive(Default)]
@@ -33,11 +42,15 @@ struct FakeState {
     /// Set when a launch happened while the same runner still had a live process.
     duplicate_launches: u32,
     fail_spawns: bool,
+    forgotten: Vec<String>,
+    /// What every sweep reports as surviving.
+    leftovers: usize,
+    sweeps: Vec<String>,
 }
 
 impl FakeLauncher {
     pub fn new() -> Self {
-        FakeLauncher { state: Mutex::new(FakeState { next_pid: 10_000, ..FakeState::default() }) }
+        FakeLauncher { state: Arc::new(Mutex::new(FakeState { next_pid: 10_000, ..FakeState::default() })) }
     }
 
     pub fn live(&self) -> Vec<FakeProcess> {
@@ -66,18 +79,42 @@ impl FakeLauncher {
         self.state.lock().unwrap().live.remove(&pid)
     }
 
-    /// Processes the supervisor asked to stop.
-    pub fn terminating(&self) -> Vec<FakeProcess> {
-        self.live().into_iter().filter(|p| p.terminate_requested).collect()
+    pub fn drained(&self) -> Vec<FakeProcess> {
+        self.live().into_iter().filter(|p| p.drained).collect()
+    }
+
+    pub fn terminated(&self) -> Vec<FakeProcess> {
+        self.live().into_iter().filter(|p| p.terminated || p.killed).collect()
+    }
+
+    /// Makes the next sweeps report `count` processes that could not be stopped.
+    pub fn set_leftovers(&self, count: usize) {
+        self.state.lock().unwrap().leftovers = count;
+    }
+
+    /// The runners swept, in order.
+    pub fn sweeps(&self) -> Vec<String> {
+        self.state.lock().unwrap().sweeps.clone()
+    }
+
+    pub fn forgotten(&self) -> Vec<String> {
+        self.state.lock().unwrap().forgotten.clone()
+    }
+
+    fn with_process(&self, runner: &RunnerRecord, change: impl FnOnce(&mut FakeProcess)) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(pid) = runner.pid {
+            if let Some(process) = state.live.get_mut(&pid) {
+                if process.runner_id == runner.id && process.generation == runner.generation {
+                    change(process);
+                }
+            }
+        }
     }
 }
 
 impl Launcher for FakeLauncher {
-    fn provision(&self, _runner: &RunnerRecord) -> Result<(), ServiceError> {
-        Ok(())
-    }
-
-    fn spawn(&self, runner: &RunnerRecord) -> Result<u32, String> {
+    fn spawn(&self, runner: &RunnerRecord, _target: &LaunchTarget) -> Result<Box<dyn PendingLaunch>, String> {
         let mut state = self.state.lock().unwrap();
         if state.fail_spawns {
             return Err("simulated launch failure".into());
@@ -94,54 +131,124 @@ impl Launcher for FakeLauncher {
                 runner_id: runner.id.clone(),
                 generation: runner.generation,
                 pid,
-                terminate_requested: false,
+                scope: runner.scope.clone(),
+                drained: false,
+                terminated: false,
+                killed: false,
+                credential: false,
             },
         );
-        Ok(pid)
+        let identity = ProcessIdentity { pid, start_time_us: pid as u64 * 1_000 };
+        Ok(Box::new(FakePending { identity, state: Arc::clone(&self.state) }))
     }
 
-    fn terminate(&self, _runner_id: &str, _generation: u64, pid: u32) {
-        if let Some(process) = self.state.lock().unwrap().live.get_mut(&pid) {
-            process.terminate_requested = true;
+    /// The start time the next pretend process will get.
+    fn clock_now(&self) -> u64 {
+        (self.state.lock().unwrap().next_pid as u64 + 1) * 1_000
+    }
+
+    fn end_unrecorded(&self, runner: &RunnerRecord, since: u64) -> (usize, usize) {
+        let mut state = self.state.lock().unwrap();
+        let before = state.live.len();
+        state.live.retain(|pid, p| {
+            !(p.runner_id == runner.id && p.generation == runner.generation && *pid as u64 * 1_000 >= since)
+        });
+        (before - state.live.len(), 0)
+    }
+
+    fn drain(&self, runner: &RunnerRecord) {
+        self.with_process(runner, |p| p.drained = true);
+    }
+
+    fn terminate(&self, runner: &RunnerRecord, force: bool) {
+        self.with_process(runner, |p| {
+            p.terminated = true;
+            p.killed |= force;
+        });
+    }
+
+    fn is_alive(&self, runner: &RunnerRecord) -> bool {
+        let Some(pid) = runner.pid else { return false };
+        self.state.lock().unwrap().live.get(&pid).is_some_and(|p| {
+            p.runner_id == runner.id
+                && p.generation == runner.generation
+                && runner.start_time_us == Some(pid as u64 * 1_000)
+        })
+    }
+
+    fn sweep(&self, runner: &RunnerRecord) -> usize {
+        let mut state = self.state.lock().unwrap();
+        state.sweeps.push(runner.id.clone());
+        state.leftovers
+    }
+
+    fn forget(&self, runner_id: &str) {
+        self.state.lock().unwrap().forgotten.push(runner_id.to_string());
+    }
+}
+
+/// A pretend process waiting for its credential: dropped without being released, it is killed.
+struct FakePending {
+    identity: ProcessIdentity,
+    state: Arc<Mutex<FakeState>>,
+}
+
+impl PendingLaunch for FakePending {
+    fn identity(&self) -> ProcessIdentity {
+        self.identity
+    }
+
+    fn release(self: Box<Self>) {
+        if let Some(process) = self.state.lock().unwrap().live.get_mut(&self.identity.pid) {
+            process.credential = true;
         }
     }
 
-    fn is_alive(&self, runner_id: &str, generation: u64, pid: u32) -> bool {
-        self.state
-            .lock()
-            .unwrap()
-            .live
-            .get(&pid)
-            .is_some_and(|p| p.runner_id == runner_id && p.generation == generation)
-    }
-
-    fn deprovision(&self, _runner_id: &str) {}
+    fn abort(self: Box<Self>) {}
 }
 
-/// The live service's launcher until the real Nestor runner is integrated (needs the Nestor API
-/// work of KCA-719): provisioning is refused, so nothing is ever launched.
+impl Drop for FakePending {
+    fn drop(&mut self) {
+        let mut state = self.state.lock().unwrap();
+        if state.live.get(&self.identity.pid).is_some_and(|p| !p.credential) {
+            state.live.remove(&self.identity.pid);
+        }
+    }
+}
+
+/// The live service's launcher while no real runner can be launched (no association, or no
+/// runner binary configured): nothing is ever launched.
 pub struct UnavailableLauncher;
 
 impl Launcher for UnavailableLauncher {
-    fn provision(&self, _runner: &RunnerRecord) -> Result<(), ServiceError> {
-        Err(ServiceError::Unavailable(
-            "Runners cannot be provisioned yet: the real runner integration is not in this version.".into(),
-        ))
+    fn spawn(&self, _runner: &RunnerRecord, _target: &LaunchTarget) -> Result<Box<dyn PendingLaunch>, String> {
+        Err("no runner can be launched in this version".into())
     }
 
-    fn spawn(&self, _runner: &RunnerRecord) -> Result<u32, String> {
-        Err("the real runner integration is not in this version".into())
+    fn clock_now(&self) -> u64 {
+        0
     }
 
-    fn terminate(&self, _runner_id: &str, _generation: u64, _pid: u32) {
+    fn end_unrecorded(&self, _runner: &RunnerRecord, _since: u64) -> (usize, usize) {
+        // Nothing was ever launched; a matching process is not ours to signal.
+        (0, 0)
+    }
+
+    fn drain(&self, _runner: &RunnerRecord) {}
+
+    fn terminate(&self, _runner: &RunnerRecord, _force: bool) {
         // Nothing was launched, so there is nothing to stop. Never signal a recorded pid that
         // could have been reused by another process.
     }
 
-    fn is_alive(&self, _runner_id: &str, _generation: u64, _pid: u32) -> bool {
-        // Without a real runner, no recorded pid can be trusted to be one of ours.
+    fn is_alive(&self, _runner: &RunnerRecord) -> bool {
         false
     }
 
-    fn deprovision(&self, _runner_id: &str) {}
+    fn sweep(&self, _runner: &RunnerRecord) -> usize {
+        // Nothing was launched, so nothing was left behind.
+        0
+    }
+
+    fn forget(&self, _runner_id: &str) {}
 }

@@ -19,6 +19,25 @@ import Testing
         #expect(status.load?.memoryTotalBytes == 38_654_705_664)
     }
 
+    @Test func decodesTheCeilingCappedByTheServer() throws {
+        let reply = data("""
+        {"ok":true,"result":{"activeTasks":[],"admission":{"state":"open"},"busyRunners":0,"cappedByServer":true,"configError":null,"configRevision":2,"connection":{"state":"associated","instance":"nestor.example","sinceMs":5000},"effectiveMaxConcurrentTasks":1,"load":null,"maxConcurrentTasks":3,"maxConcurrentTasksUpperBound":8,"mode":"automatic","serviceMode":"live"}}
+        """)
+        let status = try LiveRunnerService.decode(reply, as: Wire.Status.self).model
+        #expect(status.maxConcurrentTasks == 3, "the requested value is kept")
+        #expect(status.effectiveMaxConcurrentTasks == 1)
+        #expect(status.cappedByServer)
+    }
+
+    @Test func anOlderServiceWithoutTheEffectiveCeilingIsNotCapped() throws {
+        let reply = data("""
+        {"ok":true,"result":{"activeTasks":[],"admission":{"state":"open"},"busyRunners":0,"configError":null,"configRevision":2,"connection":{"state":"notAssociated"},"load":null,"maxConcurrentTasks":2,"maxConcurrentTasksUpperBound":8,"mode":"automatic","serviceMode":"live"}}
+        """)
+        let status = try LiveRunnerService.decode(reply, as: Wire.Status.self).model
+        #expect(status.effectiveMaxConcurrentTasks == 2)
+        #expect(!status.cappedByServer)
+    }
+
     @Test func anythingButLiveIsADemo() throws {
         let reply = data("""
         {"ok":true,"result":{"activeTasks":[{"runnerId":"0123456789abcdef0123456789abcdef","runnerName":"runner-1","taskRef":"demo-task-3","startedAtMs":1000}],"admission":{"state":"paused"},"busyRunners":1,"configError":"unreadable state file","configRevision":4,"connection":{"state":"associated","instance":"demo.nestor.invalid","sinceMs":5000},"load":null,"maxConcurrentTasks":2,"maxConcurrentTasksUpperBound":8,"mode":"paused","serviceMode":"somethingNew"}}
@@ -57,6 +76,47 @@ import Testing
     func mapsErrorCodes(body: String, expected: RunnerServiceError) {
         let reply = data(#"{"apiVersion":"1.0","id":1,"ok":false,"error":"# + body + "}")
         #expect(throws: expected) { try LiveRunnerService.decode(reply, as: Wire.Status.self) }
+    }
+
+    @Test func decodesAnAssociationInProgressAndTheAccessLevel() throws {
+        let reply = data("""
+        {"ok":true,"result":{"state":"associating","instance":"nestor.example","userCode":"WDJB-MJHT","verificationUri":"https://nestor.example/machines/approve","expiresAtMs":1793291600000}}
+        """)
+        let connection = try LiveRunnerService.decode(reply, as: Wire.Connection.self).model
+        #expect(connection == .associating(
+            instance: "nestor.example",
+            userCode: "WDJB-MJHT",
+            verificationURL: "https://nestor.example/machines/approve",
+            expiresAt: Wire.date(1_793_291_600_000)
+        ))
+        let hello = data(#"{"ok":true,"result":{"apiVersion":"1.1","serviceMode":"live","access":"readOnly","peerVerification":"signature"}}"#)
+        #expect(try LiveRunnerService.decode(hello, as: Wire.Hello.self).model == ServiceAccess(level: .readOnly, verification: .signature))
+        // An older service without these fields: the least access.
+        let old = data(#"{"ok":true,"result":{"apiVersion":"1.0","serviceMode":"live"}}"#)
+        #expect(try LiveRunnerService.decode(old, as: Wire.Hello.self).model.level == .basic)
+        let confirm = data(#"{"ok":false,"error":{"code":"confirmationRequired","message":"Confirm first: x","retryable":false}}"#)
+        #expect(throws: RunnerServiceError.confirmationRequired("Confirm first: x")) {
+            try LiveRunnerService.decode(confirm, as: Wire.Status.self)
+        }
+    }
+
+    @Test func decodesTheAccountToConfirmAndClaudesSignIn() throws {
+        let reply = data(#"{"ok":true,"result":{"state":"confirming","instance":"nestor.example","accountEmail":"o***r@example.com","approvedByEmail":"a***n@example.com"}}"#)
+        #expect(try LiveRunnerService.decode(reply, as: Wire.Connection.self).model == .confirming(
+            instance: "nestor.example",
+            accountEmail: "o***r@example.com",
+            approvedByEmail: "a***n@example.com"
+        ))
+        let admission = data(#"{"ok":true,"result":{"state":"blocked","reason":"pausedOnNestor"}}"#)
+        #expect(try LiveRunnerService.decode(admission, as: Wire.Admission.self).model == .blocked(.pausedOnNestor))
+        let waiting = data(#"{"ok":true,"result":{"state":"blocked","reason":"awaitingConfirmation"}}"#)
+        #expect(try LiveRunnerService.decode(waiting, as: Wire.Admission.self).model == .blocked(.awaitingConfirmation))
+    }
+
+    @Test func runnerNamesAreASCII() {
+        #expect(throws: RunnerServiceError.self) { try RunnerNameRule.validate("caf\u{e9}") }
+        #expect(throws: RunnerServiceError.self) { try RunnerNameRule.validate("runner\u{2010}1") }
+        #expect((try? RunnerNameRule.validate(" studio-ci_2.1 ")) == "studio-ci_2.1")
     }
 
     @Test func unreachableServiceIsUnavailable() async {

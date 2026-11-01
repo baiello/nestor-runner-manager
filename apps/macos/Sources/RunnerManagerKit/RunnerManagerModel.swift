@@ -28,6 +28,10 @@ public final class RunnerManagerModel {
     /// Runners with a command in flight; their actions are disabled meanwhile.
     public private(set) var busyRunners: Set<Runner.ID> = []
     public private(set) var isAssociating = false
+    /// What the service lets this app do; `nil` until it has answered.
+    public private(set) var access: ServiceAccess?
+    /// A higher "tasks at a time" waiting for the user's confirmation.
+    public var pendingCeilingRaise: Int?
     /// The last failed command, shown as an alert.
     public var actionError: String?
 
@@ -45,6 +49,11 @@ public final class RunnerManagerModel {
 
     public var isAssociated: Bool {
         if case .loaded(.associated) = connection { true } else { false }
+    }
+
+    /// Whether the app may change settings (the service decides, from its code signature).
+    public var canChange: Bool {
+        access.map { $0.level == .full } ?? true
     }
 
     public func runner(_ id: Runner.ID) -> Runner? {
@@ -65,7 +74,13 @@ public final class RunnerManagerModel {
         connection = await connectionResult
         status = await statusResult
         runners = await runnersResult
+        access = try? await service.access()
+        if access?.level == .basic, runners.value == nil {
+            runners = .failed(Self.runnersNeedSignedApp)
+        }
     }
+
+    static let runnersNeedSignedApp = "The runner service shows its runners to the signed app only."
 
     /// Periodic refresh of what moves on its own (status, connection, runners). A failure only
     /// replaces a value that was not loaded, so a transient error does not blank the screen.
@@ -76,7 +91,9 @@ public final class RunnerManagerModel {
         let (newStatus, newConnection, newRunners) = await (statusResult, connectionResult, runnersResult)
         if newStatus.value != nil || status.value == nil { status = newStatus }
         if newConnection.value != nil || connection.value == nil { connection = newConnection }
-        if newRunners.value != nil || runners.value == nil { runners = newRunners }
+        if newRunners.value != nil || runners.value == nil {
+            runners = access?.level == .basic && newRunners.value == nil ? .failed(Self.runnersNeedSignedApp) : newRunners
+        }
     }
 
     public func associate() async {
@@ -95,10 +112,62 @@ public final class RunnerManagerModel {
         await updateSettings { service, revision in try await service.setMode(mode, expectedRevision: revision) }
     }
 
+    /// Asks for a new "tasks at a time". Lowering applies at once (it interrupts nothing);
+    /// raising waits for `confirmCeilingRaise()`.
+    public func requestMaxConcurrentTasks(_ value: Int) async {
+        guard let current = status.value?.maxConcurrentTasks else { return }
+        if value > current {
+            pendingCeilingRaise = value
+        } else {
+            await setMaxConcurrentTasks(value)
+        }
+    }
+
+    public func confirmCeilingRaise() async {
+        guard let value = pendingCeilingRaise else { return }
+        pendingCeilingRaise = nil
+        await setMaxConcurrentTasks(value, confirmed: true)
+    }
+
     /// Changes how many tasks may run at the same time. Lowering it interrupts no task.
-    public func setMaxConcurrentTasks(_ value: Int) async {
+    public func setMaxConcurrentTasks(_ value: Int, confirmed: Bool = false) async {
         await updateSettings { service, revision in
-            try await service.setMaxConcurrentTasks(value, expectedRevision: revision)
+            try await service.setMaxConcurrentTasks(value, expectedRevision: revision, confirmed: confirmed)
+        }
+    }
+
+    public func cancelAssociation() async {
+        do {
+            connection = .loaded(try await service.cancelAssociation())
+        } catch {
+            actionError = Self.message(for: error)
+        }
+    }
+
+    /// The owner's answer to the Nestor account shown (M1): accepted, the machine takes tasks;
+    /// refused, it disassociates itself and erases its credentials.
+    public func confirmAssociation(accept: Bool) async {
+        do {
+            connection = .loaded(try await service.confirmAssociation(accept: accept))
+            async let statusResult = capture { try await self.service.machineStatus() }
+            async let runnersResult = capture { try await self.service.runners() }
+            status = await statusResult
+            runners = await runnersResult
+        } catch {
+            actionError = Self.message(for: error)
+        }
+    }
+
+    /// Ends the association, after the user confirmed: running tasks end, credentials are erased.
+    public func disassociate() async {
+        do {
+            connection = .loaded(try await service.disassociate())
+            async let statusResult = capture { try await self.service.machineStatus() }
+            async let runnersResult = capture { try await self.service.runners() }
+            status = await statusResult
+            runners = await runnersResult
+        } catch {
+            actionError = Self.message(for: error)
         }
     }
 

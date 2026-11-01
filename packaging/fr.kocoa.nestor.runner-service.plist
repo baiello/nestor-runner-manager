@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The runner service as a LaunchDaemon, started before login (docs/launch-daemon.md).
+  Replace BRICE with the short name of the account (`id -un`), then install it as
+  /Library/LaunchDaemons/fr.kocoa.nestor.runner-service.plist, owned by root:wheel, 0644.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>fr.kocoa.nestor.runner-service</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Library/Application Support/Nestor Runner Manager/bin/nestor-runner-service</string>
+		<string>--data-dir</string>
+		<string>/Users/BRICE/Library/Application Support/Nestor Runner Manager/live</string>
+	</array>
+	<key>UserName</key>
+	<string>BRICE</string>
+	<key>GroupName</key>
+	<string>staff</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/BRICE</string>
+		<key>PATH</key>
+		<string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>LANG</key>
+		<string>en_US.UTF-8</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>ProcessType</key>
+	<string>Standard</string>
+	<key>Umask</key>
+	<integer>63</integer>
+	<key>ExitTimeOut</key>
+	<integer>30</integer>
+	<key>StandardOutPath</key>
+	<string>/Users/BRICE/Library/Logs/Nestor Runner Manager/service.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/BRICE/Library/Logs/Nestor Runner Manager/service.log</string>
+</dict>
+</plist>
